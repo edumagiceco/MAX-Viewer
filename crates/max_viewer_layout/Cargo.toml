@@ -1,0 +1,10 @@
+[package]
+name = "max_viewer_layout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+max_viewer_core.workspace = true
+serde.workspace = true

@@ -1,0 +1,16 @@
+{
+  "name": "max-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.19.0",
+  "scripts": {
+    "dev": "pnpm --dir apps/desktop-tauri dev",
+    "dev:web": "pnpm --dir packages/viewer-ui dev --host 127.0.0.1 --port 1420",
+    "build": "pnpm build:web && cargo check --workspace",
+    "build:web": "pnpm --dir packages/viewer-ui build",
+    "build:desktop": "pnpm --dir apps/desktop-tauri build",
+    "check": "pnpm build:web && cargo check --workspace",
+    "check:rust": "cargo check --workspace",
+    "check:web": "pnpm --dir packages/viewer-ui build"
+  }
+}

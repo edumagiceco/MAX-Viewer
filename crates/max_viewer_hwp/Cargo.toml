@@ -1,0 +1,11 @@
+[package]
+name = "max_viewer_hwp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+cfb.workspace = true
+flate2.workspace = true
+max_viewer_core.workspace = true
