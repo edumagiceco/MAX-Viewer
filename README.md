@@ -44,3 +44,5 @@ MAX-Viewer/
 - `packages/viewer-ui`: 네이티브 문서 열기, 페이지 분할, 실제 이미지 렌더링, 표 셀 내부 조판, floating 개체 배치가 연결된 뷰어 UI
 
 세부 설계는 [docs/README.md](/Users/magic/work/MAX-Viewer/docs/README.md)에 정리되어 있습니다.
+
+사용자 실행 방법은 [usage-guide.md](/Users/magic/work/MAX-Viewer/docs/usage-guide.md)에 정리되어 있습니다.
