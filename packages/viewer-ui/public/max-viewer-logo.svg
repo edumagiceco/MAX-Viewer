@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="36" y1="28" x2="220" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FCFEFF" />
+      <stop offset="1" stop-color="#DCEBFF" />
+    </linearGradient>
+    <linearGradient id="core" x1="64" y1="62" x2="208" y2="190" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7C3AED" />
+      <stop offset="0.5" stop-color="#5B21B6" />
+      <stop offset="1" stop-color="#0EA5E9" />
+    </linearGradient>
+    <linearGradient id="cap" x1="132" y1="46" x2="206" y2="108" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#312E81" />
+      <stop offset="1" stop-color="#7C3AED" />
+    </linearGradient>
+    <linearGradient id="gold" x1="38" y1="40" x2="74" y2="76" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FDE68A" />
+      <stop offset="1" stop-color="#F59E0B" />
+    </linearGradient>
+    <filter id="shadow" x="8" y="10" width="240" height="240" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix" />
+      <feColorMatrix in="SourceAlpha" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha" />
+      <feOffset dy="10" />
+      <feGaussianBlur stdDeviation="12" />
+      <feColorMatrix values="0 0 0 0 0.0901961 0 0 0 0 0.188235 0 0 0 0 0.333333 0 0 0 0.16 0" />
+      <feBlend in2="BackgroundImageFix" result="effect1_dropShadow_0_1" />
+      <feBlend in="SourceGraphic" in2="effect1_dropShadow_0_1" result="shape" />
+    </filter>
+    <filter id="glow" x="40" y="44" width="180" height="150" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix" />
+      <feGaussianBlur in="SourceGraphic" stdDeviation="10" result="blurred" />
+      <feColorMatrix in="blurred" values="1 0 0 0 0 0 1 0 0 0.15 0 0 1 0 0.3 0 0 0 0.25 0" />
+    </filter>
+  </defs>
+
+  <g filter="url(#shadow)">
+    <rect x="16" y="16" width="224" height="224" rx="56" fill="url(#bg)" />
+  </g>
+
+  <circle cx="75" cy="198" r="26" fill="#C7D9FF" fill-opacity="0.38" />
+  <circle cx="194" cy="64" r="20" fill="#E0EBFF" fill-opacity="0.72" />
+
+  <path
+    d="M58 149C49 103 79 66 120 61C133 51 148 46 166 46C198 46 225 68 233 99C238 117 234 135 223 149C211 164 194 173 173 173H90C72 173 61 165 58 149Z"
+    fill="url(#core)"
+  />
+  <path
+    d="M146 48C171 49 195 62 208 83C213 90 208 101 199 101H169C159 101 151 93 151 83L146 48Z"
+    fill="url(#cap)"
+  />
+  <path
+    d="M70 169C88 184 110 192 134 192C164 192 192 180 213 160C199 184 171 202 138 202C111 202 86 190 70 169Z"
+    fill="#1D4ED8"
+    fill-opacity="0.18"
+  />
+
+  <g opacity="0.32" filter="url(#glow)">
+    <path
+      d="M58 149C49 103 79 66 120 61C133 51 148 46 166 46C198 46 225 68 233 99C238 117 234 135 223 149C211 164 194 173 173 173H90C72 173 61 165 58 149Z"
+      fill="#8B5CF6"
+    />
+  </g>
+
+  <g stroke="#F8FBFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M76 145L98 121L126 150L154 118L180 143" />
+    <path d="M92 159L126 150L161 160" />
+    <path d="M98 121L124 98L154 118" />
+    <path d="M124 98L148 86L174 100" />
+    <path d="M76 145L92 159" />
+    <path d="M180 143L161 160" />
+  </g>
+
+  <g fill="#F8FBFF">
+    <circle cx="76" cy="145" r="8" />
+    <circle cx="98" cy="121" r="8" />
+    <circle cx="124" cy="98" r="8" />
+    <circle cx="148" cy="86" r="7" />
+    <circle cx="174" cy="100" r="8" />
+    <circle cx="154" cy="118" r="8" />
+    <circle cx="126" cy="150" r="9" />
+    <circle cx="92" cy="159" r="7" />
+    <circle cx="161" cy="160" r="7" />
+    <circle cx="180" cy="143" r="8" />
+  </g>
+
+  <g fill="url(#gold)">
+    <path d="M48 56L52 44L56 56L68 60L56 64L52 76L48 64L36 60L48 56Z" />
+  </g>
+  <g fill="#60A5FA">
+    <path d="M197 52L200 43L203 52L212 55L203 58L200 67L197 58L188 55L197 52Z" />
+    <path d="M204 138L206 132L208 138L214 140L208 142L206 148L204 142L198 140L204 138Z" />
+  </g>
+</svg>

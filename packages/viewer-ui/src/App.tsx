@@ -856,10 +856,13 @@ function App() {
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div className="title-wrap">
-          <p className="app-kicker">HWP / HWPX Viewer</p>
-          <h1>MAX-Viewer</h1>
-          <p className="app-subtitle">한컴 문서를 페이지 형태로 읽는 뷰어</p>
+        <div className="brand-lockup">
+          <img className="brand-mark" src="/max-viewer-logo.svg" alt="MAX Viewer logo" />
+          <div className="title-wrap">
+            <p className="app-kicker">HWP / HWPX Viewer</p>
+            <h1>MAX Viewer</h1>
+            <p className="app-subtitle">한컴 문서를 페이지 형태로 읽는 뷰어</p>
+          </div>
         </div>
 
         <div className="toolbar">

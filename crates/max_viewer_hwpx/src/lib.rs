@@ -4,7 +4,7 @@ use std::{
     path::Path,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use max_viewer_core::{
     AssetRef, Block, Document, DocumentDiagnostics, DocumentFormat, DocumentMetadata,
     FormatInspector, FormatSupport, HeaderFooter, ImageBlock, PageLayout, Paragraph,
@@ -114,7 +114,8 @@ impl HwpxInspector {
 
         let section_entries = resolve_section_entries(content_manifest.as_deref(), &mut archive)?;
         let asset_collection = collect_assets(content_manifest.as_deref(), &mut archive)?;
-        let metadata = parse_header_metadata(header_xml.as_deref(), fallback_title, section_entries.len());
+        let metadata =
+            parse_header_metadata(header_xml.as_deref(), fallback_title, section_entries.len());
         let style_resolver = parse_style_resolver(header_xml.as_deref());
 
         let mut sections = Vec::with_capacity(section_entries.len());
@@ -180,9 +181,7 @@ impl FormatInspector for HwpxInspector {
             }
         }
 
-        let mut notes = vec![
-            "HWPX 문서 컨테이너를 정상적으로 열었습니다.".to_string(),
-        ];
+        let mut notes = vec!["HWPX 문서 컨테이너를 정상적으로 열었습니다.".to_string()];
 
         if !has_header {
             notes.push("Contents/header.xml is missing.".to_string());
@@ -381,9 +380,9 @@ fn collect_assets(
                 .map_err(|error| ParseError::InvalidData(error.to_string()))?;
 
             let canonical_id = name.clone();
-            let data_uri = media_type.starts_with("image/").then(|| {
-                format!("data:{media_type};base64,{}", BASE64_STANDARD.encode(bytes))
-            });
+            let data_uri = media_type
+                .starts_with("image/")
+                .then(|| format!("data:{media_type};base64,{}", BASE64_STANDARD.encode(bytes)));
 
             register_asset_aliases(&mut lookup, &canonical_id, Some(&name));
 
@@ -412,7 +411,9 @@ fn collect_assets(
     Ok(AssetCollection { assets, lookup })
 }
 
-fn parse_manifest_entries(content_manifest: Option<&str>) -> Result<BTreeMap<String, String>, ParseError> {
+fn parse_manifest_entries(
+    content_manifest: Option<&str>,
+) -> Result<BTreeMap<String, String>, ParseError> {
     let Some(xml) = content_manifest else {
         return Ok(BTreeMap::new());
     };
@@ -442,18 +443,27 @@ fn register_asset_aliases(
 ) {
     lookup.insert(canonical_id.to_string(), canonical_id.to_string());
 
-    if let Some(path) = Path::new(canonical_id).file_name().and_then(|value| value.to_str()) {
+    if let Some(path) = Path::new(canonical_id)
+        .file_name()
+        .and_then(|value| value.to_str())
+    {
         lookup.insert(path.to_string(), canonical_id.to_string());
     }
 
-    if let Some(stem) = Path::new(canonical_id).file_stem().and_then(|value| value.to_str()) {
+    if let Some(stem) = Path::new(canonical_id)
+        .file_stem()
+        .and_then(|value| value.to_str())
+    {
         lookup.insert(stem.to_string(), canonical_id.to_string());
     }
 
     if let Some(alias) = extra_alias.filter(|alias| !alias.trim().is_empty()) {
         lookup.insert(alias.to_string(), canonical_id.to_string());
 
-        if let Some(stem) = Path::new(alias).file_stem().and_then(|value| value.to_str()) {
+        if let Some(stem) = Path::new(alias)
+            .file_stem()
+            .and_then(|value| value.to_str())
+        {
             lookup.insert(stem.to_string(), canonical_id.to_string());
         }
     }
@@ -560,7 +570,12 @@ fn parse_style_resolver(header_xml: Option<&str>) -> HwpxStyleResolver {
     let char_styles = document
         .descendants()
         .filter(|node| node.is_element() && node.tag_name().name() == "charPr")
-        .filter_map(|node| Some((parse_u32_attribute(node, "id")?, parse_text_style(node, &font_faces))))
+        .filter_map(|node| {
+            Some((
+                parse_u32_attribute(node, "id")?,
+                parse_text_style(node, &font_faces),
+            ))
+        })
         .collect::<BTreeMap<_, _>>();
 
     let para_styles = document
@@ -591,13 +606,23 @@ fn parse_style_resolver(header_xml: Option<&str>) -> HwpxStyleResolver {
     let numberings = document
         .descendants()
         .filter(|node| node.is_element() && node.tag_name().name() == "numbering")
-        .filter_map(|node| Some((parse_u32_attribute(node, "id")?, parse_numbering_definition(node))))
+        .filter_map(|node| {
+            Some((
+                parse_u32_attribute(node, "id")?,
+                parse_numbering_definition(node),
+            ))
+        })
         .collect::<BTreeMap<_, _>>();
 
     let bullets = document
         .descendants()
         .filter(|node| node.is_element() && node.tag_name().name() == "bullet")
-        .filter_map(|node| Some((parse_u32_attribute(node, "id")?, parse_bullet_definition(node))))
+        .filter_map(|node| {
+            Some((
+                parse_u32_attribute(node, "id")?,
+                parse_bullet_definition(node),
+            ))
+        })
         .collect::<BTreeMap<_, _>>();
 
     let begin_page = document
@@ -648,11 +673,17 @@ fn parse_para_head_definition(node: Node<'_, '_>) -> ParaHeadDefinition {
     ParaHeadDefinition {
         level: parse_u32_attribute(node, "level").unwrap_or(0),
         start: parse_u32_attribute(node, "start"),
-        pattern: node.text().map(str::trim).filter(|text| !text.is_empty()).map(str::to_string),
+        pattern: node
+            .text()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
         num_format: node.attribute("numFormat").map(|value| value.to_string()),
         align: node.attribute("align").map(|value| value.to_string()),
         width_adjust: parse_i32_attribute(node, "widthAdjust"),
-        text_offset_type: node.attribute("textOffsetType").map(|value| value.to_string()),
+        text_offset_type: node
+            .attribute("textOffsetType")
+            .map(|value| value.to_string()),
         text_offset: parse_i32_attribute(node, "textOffset"),
         char_pr_id_ref: parse_u32_attribute(node, "charPrIDRef"),
     }
@@ -726,7 +757,8 @@ fn parse_paragraph(
         runs = inject_line_breaks_into_runs(runs, &line_break_positions);
     }
 
-    let marker_resolution = resolve_paragraph_marker(paragraph_style.as_mut(), style_resolver, state);
+    let marker_resolution =
+        resolve_paragraph_marker(paragraph_style.as_mut(), style_resolver, state);
     Some(Paragraph {
         marker: marker_resolution.map(|resolution| resolution.marker),
         runs,
@@ -785,7 +817,9 @@ fn parse_line_break_positions(paragraph_node: Node<'_, '_>) -> Vec<usize> {
             line_seg_array
                 .children()
                 .filter(|child| child.is_element() && child.tag_name().name() == "lineseg")
-                .filter_map(|line_seg| parse_u32_attribute(line_seg, "textpos").map(|value| value as usize))
+                .filter_map(|line_seg| {
+                    parse_u32_attribute(line_seg, "textpos").map(|value| value as usize)
+                })
         })
         .collect::<Vec<_>>();
 
@@ -795,13 +829,19 @@ fn parse_line_break_positions(paragraph_node: Node<'_, '_>) -> Vec<usize> {
     positions
 }
 
-fn inject_line_breaks_into_runs(runs: Vec<TextRun>, line_break_positions: &[usize]) -> Vec<TextRun> {
+fn inject_line_breaks_into_runs(
+    runs: Vec<TextRun>,
+    line_break_positions: &[usize],
+) -> Vec<TextRun> {
     if runs.is_empty() || line_break_positions.is_empty() {
         return runs;
     }
 
     let mut normalized_breaks = line_break_positions.iter().copied().peekable();
-    let total_chars = runs.iter().map(|run| run.text.chars().count()).sum::<usize>();
+    let total_chars = runs
+        .iter()
+        .map(|run| run.text.chars().count())
+        .sum::<usize>();
     let mut global_char_index = 0usize;
     let mut output = Vec::new();
 
@@ -917,15 +957,29 @@ fn resolve_paragraph_marker(
             let marker_text = definition
                 .bullet_char
                 .clone()
-                .or_else(|| definition.para_head.as_ref().and_then(|para_head| para_head.pattern.clone()))
+                .or_else(|| {
+                    definition
+                        .para_head
+                        .as_ref()
+                        .and_then(|para_head| para_head.pattern.clone())
+                })
                 .unwrap_or_else(|| "•".to_string());
-            style.marker_align = definition.para_head.as_ref().and_then(|para_head| para_head.align.clone());
-            style.marker_width_adjust = definition.para_head.as_ref().and_then(|para_head| para_head.width_adjust);
+            style.marker_align = definition
+                .para_head
+                .as_ref()
+                .and_then(|para_head| para_head.align.clone());
+            style.marker_width_adjust = definition
+                .para_head
+                .as_ref()
+                .and_then(|para_head| para_head.width_adjust);
             style.marker_text_offset_type = definition
                 .para_head
                 .as_ref()
                 .and_then(|para_head| para_head.text_offset_type.clone());
-            style.marker_text_offset = definition.para_head.as_ref().and_then(|para_head| para_head.text_offset);
+            style.marker_text_offset = definition
+                .para_head
+                .as_ref()
+                .and_then(|para_head| para_head.text_offset);
             Some(ParagraphMarkerResolution {
                 marker: TextRun {
                     text: format!("{marker_text} "),
@@ -1032,8 +1086,8 @@ fn to_latin(value: u32, upper: bool) -> String {
 
 fn to_circled_digit(value: u32) -> String {
     const CIRCLED: [&str; 20] = [
-        "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩",
-        "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰", "⑱", "⑲", "⑳",
+        "①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨", "⑩", "⑪", "⑫", "⑬", "⑭", "⑮", "⑯", "⑰", "⑱",
+        "⑲", "⑳",
     ];
     if let Some(circled) = CIRCLED.get(value.saturating_sub(1) as usize) {
         (*circled).to_string()
@@ -1043,7 +1097,9 @@ fn to_circled_digit(value: u32) -> String {
 }
 
 fn to_hangul_jamo(value: u32) -> String {
-    const JAMO: [&str; 14] = ["ㄱ", "ㄴ", "ㄷ", "ㄹ", "ㅁ", "ㅂ", "ㅅ", "ㅇ", "ㅈ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"];
+    const JAMO: [&str; 14] = [
+        "ㄱ", "ㄴ", "ㄷ", "ㄹ", "ㅁ", "ㅂ", "ㅅ", "ㅇ", "ㅈ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ",
+    ];
     if let Some(jamo) = JAMO.get(value.saturating_sub(1) as usize) {
         (*jamo).to_string()
     } else {
@@ -1052,7 +1108,9 @@ fn to_hangul_jamo(value: u32) -> String {
 }
 
 fn to_hangul_syllable(value: u32) -> String {
-    const SYLLABLE: [&str; 14] = ["가", "나", "다", "라", "마", "바", "사", "아", "자", "차", "카", "타", "파", "하"];
+    const SYLLABLE: [&str; 14] = [
+        "가", "나", "다", "라", "마", "바", "사", "아", "자", "차", "카", "타", "파", "하",
+    ];
     if let Some(syllable) = SYLLABLE.get(value.saturating_sub(1) as usize) {
         (*syllable).to_string()
     } else {
@@ -1075,10 +1133,18 @@ fn parse_header_footers(
 
             let mut state = SectionParseState::default();
             let mut blocks = Vec::new();
-            collect_blocks(sub_list, style_resolver, &BTreeMap::new(), &mut state, &mut blocks);
+            collect_blocks(
+                sub_list,
+                style_resolver,
+                &BTreeMap::new(),
+                &mut state,
+                &mut blocks,
+            );
 
             Some(HeaderFooter {
-                apply_page_type: node.attribute("applyPageType").map(|value| value.to_string()),
+                apply_page_type: node
+                    .attribute("applyPageType")
+                    .map(|value| value.to_string()),
                 blocks,
             })
         })
@@ -1164,7 +1230,12 @@ fn parse_text_style(
     let underline = node
         .children()
         .find(|child| child.is_element() && child.tag_name().name() == "underline")
-        .map(|underline| underline.attribute("type").map(|value| value != "NONE").unwrap_or(true))
+        .map(|underline| {
+            underline
+                .attribute("type")
+                .map(|value| value != "NONE")
+                .unwrap_or(true)
+        })
         .unwrap_or(false);
 
     let ratio = node
@@ -1187,12 +1258,8 @@ fn parse_text_style(
     TextStyle {
         font_family,
         font_size: parse_i32_attribute(node, "height"),
-        text_color: node
-            .attribute("textColor")
-            .and_then(normalize_color_value),
-        background_color: node
-            .attribute("shadeColor")
-            .and_then(normalize_color_value),
+        text_color: node.attribute("textColor").and_then(normalize_color_value),
+        background_color: node.attribute("shadeColor").and_then(normalize_color_value),
         width_ratio: ratio,
         letter_spacing: spacing,
         relative_size,
@@ -1259,13 +1326,7 @@ fn parse_hwp_value_child(node: Node<'_, '_>, child_name: &str) -> Option<i32> {
 
 fn parse_language_i32_attribute(node: Node<'_, '_>) -> Option<i32> {
     [
-        "hangul",
-        "latin",
-        "other",
-        "hanja",
-        "japanese",
-        "symbol",
-        "user",
+        "hangul", "latin", "other", "hanja", "japanese", "symbol", "user",
     ]
     .into_iter()
     .find_map(|attribute_name| parse_i32_attribute(node, attribute_name))
@@ -1296,7 +1357,10 @@ fn normalize_color_value(raw: &str) -> Option<String> {
         return Some(trimmed.to_string());
     }
 
-    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
         let parsed = u32::from_str_radix(hex, 16).ok()?;
         return Some(format!("#{:06X}", parsed & 0x00ff_ffff));
     }
@@ -1411,10 +1475,7 @@ fn parse_cell(
     }
 }
 
-fn parse_image(
-    node: Node<'_, '_>,
-    asset_lookup: &BTreeMap<String, String>,
-) -> Option<ImageBlock> {
+fn parse_image(node: Node<'_, '_>, asset_lookup: &BTreeMap<String, String>) -> Option<ImageBlock> {
     let raw_asset_id = extract_asset_reference(node);
 
     let asset_id = raw_asset_id
@@ -1442,10 +1503,18 @@ fn parse_image(
             .unwrap_or(false),
         text_wrap: node.attribute("textWrap").map(|value| value.to_string()),
         z_order: parse_i32_attribute(node, "zOrder"),
-        vert_rel_to: position.as_ref().and_then(|position| position.vert_rel_to.clone()),
-        horz_rel_to: position.as_ref().and_then(|position| position.horz_rel_to.clone()),
-        vert_align: position.as_ref().and_then(|position| position.vert_align.clone()),
-        horz_align: position.as_ref().and_then(|position| position.horz_align.clone()),
+        vert_rel_to: position
+            .as_ref()
+            .and_then(|position| position.vert_rel_to.clone()),
+        horz_rel_to: position
+            .as_ref()
+            .and_then(|position| position.horz_rel_to.clone()),
+        vert_align: position
+            .as_ref()
+            .and_then(|position| position.vert_align.clone()),
+        horz_align: position
+            .as_ref()
+            .and_then(|position| position.horz_align.clone()),
         vert_offset: position.as_ref().and_then(|position| position.vert_offset),
         horz_offset: position.as_ref().and_then(|position| position.horz_offset),
         caption,
@@ -1466,11 +1535,9 @@ struct ParsedPosition {
 fn parse_size_attributes(
     node: Node<'_, '_>,
 ) -> (Option<i32>, Option<i32>, Option<String>, Option<String>) {
-    let size_node = node
-        .children()
-        .find(|child| {
-            child.is_element() && matches!(child.tag_name().name(), "sz" | "curSz" | "orgSz")
-        });
+    let size_node = node.children().find(|child| {
+        child.is_element() && matches!(child.tag_name().name(), "sz" | "curSz" | "orgSz")
+    });
 
     (
         size_node.and_then(|size| parse_i32_attribute(size, "width")),
@@ -1487,10 +1554,18 @@ fn parse_position_attributes(node: Node<'_, '_>) -> Option<ParsedPosition> {
 
     Some(ParsedPosition {
         treat_as_char: parse_bool_attribute(position_node, "treatAsChar"),
-        vert_rel_to: position_node.attribute("vertRelTo").map(|value| value.to_string()),
-        horz_rel_to: position_node.attribute("horzRelTo").map(|value| value.to_string()),
-        vert_align: position_node.attribute("vertAlign").map(|value| value.to_string()),
-        horz_align: position_node.attribute("horzAlign").map(|value| value.to_string()),
+        vert_rel_to: position_node
+            .attribute("vertRelTo")
+            .map(|value| value.to_string()),
+        horz_rel_to: position_node
+            .attribute("horzRelTo")
+            .map(|value| value.to_string()),
+        vert_align: position_node
+            .attribute("vertAlign")
+            .map(|value| value.to_string()),
+        horz_align: position_node
+            .attribute("horzAlign")
+            .map(|value| value.to_string()),
         vert_offset: parse_i32_attribute(position_node, "vertOffset"),
         horz_offset: parse_i32_attribute(position_node, "horzOffset"),
     })
@@ -1504,7 +1579,10 @@ fn parse_caption_text(node: Node<'_, '_>) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn resolve_asset_reference(raw_asset_id: &str, asset_lookup: &BTreeMap<String, String>) -> Option<String> {
+fn resolve_asset_reference(
+    raw_asset_id: &str,
+    asset_lookup: &BTreeMap<String, String>,
+) -> Option<String> {
     let trimmed = raw_asset_id.trim();
     if trimmed.is_empty() {
         return None;
@@ -1537,7 +1615,11 @@ fn extract_asset_reference(node: Node<'_, '_>) -> Option<String> {
     const STRONG_PRIORITY: [&str; 4] = ["binaryItemIDRef", "href", "src", "idref"];
 
     for attribute_name in STRONG_PRIORITY {
-        if let Some(value) = node.attribute(attribute_name).map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(value) = node
+            .attribute(attribute_name)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             return Some(value.to_string());
         }
     }
@@ -1547,7 +1629,8 @@ fn extract_asset_reference(node: Node<'_, '_>) -> Option<String> {
         .filter(|child| child.is_element())
         .find_map(|child| {
             STRONG_PRIORITY.into_iter().find_map(|attribute_name| {
-                child.attribute(attribute_name)
+                child
+                    .attribute(attribute_name)
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .map(str::to_string)
@@ -1565,7 +1648,8 @@ fn extract_asset_reference(node: Node<'_, '_>) -> Option<String> {
             node.descendants()
                 .filter(|child| child.is_element())
                 .find_map(|child| {
-                    child.attribute("id")
+                    child
+                        .attribute("id")
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
                         .map(str::to_string)
@@ -1637,7 +1721,7 @@ fn collect_text_parts(node: Node<'_, '_>, output: &mut String) {
         if child.is_text() {
             if matches!(node.tag_name().name(), "t" | "text") {
                 if let Some(text) = child.text() {
-                    output.push_str(text);
+                    output.push_str(&sanitize_text_fragment(text));
                 }
             }
             continue;
@@ -1654,6 +1738,20 @@ fn collect_text_parts(node: Node<'_, '_>, output: &mut String) {
             "autoNum" => output.push_str(&auto_num_placeholder_for(child)),
             _ => collect_text_parts(child, output),
         }
+    }
+}
+
+fn sanitize_text_fragment(text: &str) -> String {
+    text.chars()
+        .filter(|ch| should_keep_text_char(*ch))
+        .collect()
+}
+
+fn should_keep_text_char(ch: char) -> bool {
+    match ch {
+        '\n' | '\t' => true,
+        '\r' | '\u{FEFF}' | '\u{FFFC}' | '\u{FFF9}'..='\u{FFFB}' => false,
+        _ => !ch.is_control(),
     }
 }
 
@@ -1830,8 +1928,17 @@ mod tests {
             .expect("fixture should parse");
 
         assert_eq!(parsed.document.sections.len(), 1);
-        assert_eq!(parsed.document.metadata.title.as_deref(), Some("fixture.hwpx"));
-        assert_eq!(parsed.document.sections[0].page_layout.as_ref().and_then(|layout| layout.width), Some(59528));
+        assert_eq!(
+            parsed.document.metadata.title.as_deref(),
+            Some("fixture.hwpx")
+        );
+        assert_eq!(
+            parsed.document.sections[0]
+                .page_layout
+                .as_ref()
+                .and_then(|layout| layout.width),
+            Some(59528)
+        );
         assert!(matches!(
             parsed.document.sections[0].blocks[0],
             Block::Paragraph(_)
@@ -1842,7 +1949,13 @@ mod tests {
         ));
         match &parsed.document.sections[0].blocks[0] {
             Block::Paragraph(paragraph) => {
-                assert_eq!(paragraph.style.as_ref().and_then(|style| style.align.as_deref()), Some("CENTER"));
+                assert_eq!(
+                    paragraph
+                        .style
+                        .as_ref()
+                        .and_then(|style| style.align.as_deref()),
+                    Some("CENTER")
+                );
                 assert_eq!(paragraph.runs.len(), 2);
                 assert_eq!(
                     paragraph
@@ -1852,10 +1965,30 @@ mod tests {
                         .collect::<String>(),
                     "Hello MAX-Viewer"
                 );
-                assert_eq!(paragraph.runs[0].style.as_ref().and_then(|style| style.font_family.as_deref()), Some("Malgun Gothic"));
-                assert_eq!(paragraph.runs[0].style.as_ref().and_then(|style| style.text_color.as_deref()), Some("#6182D6"));
-                assert!(paragraph.runs[0].style.as_ref().map(|style| style.bold).unwrap_or(false));
-                assert!(paragraph.runs[1].style.as_ref().map(|style| style.italic).unwrap_or(false));
+                assert_eq!(
+                    paragraph.runs[0]
+                        .style
+                        .as_ref()
+                        .and_then(|style| style.font_family.as_deref()),
+                    Some("Malgun Gothic")
+                );
+                assert_eq!(
+                    paragraph.runs[0]
+                        .style
+                        .as_ref()
+                        .and_then(|style| style.text_color.as_deref()),
+                    Some("#6182D6")
+                );
+                assert!(paragraph.runs[0]
+                    .style
+                    .as_ref()
+                    .map(|style| style.bold)
+                    .unwrap_or(false));
+                assert!(paragraph.runs[1]
+                    .style
+                    .as_ref()
+                    .map(|style| style.italic)
+                    .unwrap_or(false));
             }
             _ => panic!("expected paragraph block"),
         }
@@ -1888,7 +2021,11 @@ mod tests {
         match &parsed.document.sections[0].blocks[0] {
             Block::Paragraph(paragraph) => {
                 assert_eq!(
-                    paragraph.runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+                    paragraph
+                        .runs
+                        .iter()
+                        .map(|run| run.text.as_str())
+                        .collect::<String>(),
                     "Before after"
                 );
             }
@@ -1957,7 +2094,11 @@ mod tests {
         match &parsed.document.sections[0].headers[0].blocks[0] {
             Block::Paragraph(paragraph) => {
                 assert_eq!(
-                    paragraph.runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+                    paragraph
+                        .runs
+                        .iter()
+                        .map(|run| run.text.as_str())
+                        .collect::<String>(),
                     "Header {{PAGE:DIGIT:-}}"
                 );
             }
@@ -1966,14 +2107,20 @@ mod tests {
 
         match &parsed.document.sections[0].blocks[0] {
             Block::Paragraph(paragraph) => {
-                assert_eq!(paragraph.marker.as_ref().map(|marker| marker.text.as_str()), Some("1. "));
+                assert_eq!(
+                    paragraph.marker.as_ref().map(|marker| marker.text.as_str()),
+                    Some("1. ")
+                );
             }
             _ => panic!("expected first body paragraph"),
         }
 
         match &parsed.document.sections[0].blocks[1] {
             Block::Paragraph(paragraph) => {
-                assert_eq!(paragraph.marker.as_ref().map(|marker| marker.text.as_str()), Some("• "));
+                assert_eq!(
+                    paragraph.marker.as_ref().map(|marker| marker.text.as_str()),
+                    Some("• ")
+                );
             }
             _ => panic!("expected second body paragraph"),
         }
@@ -2002,8 +2149,42 @@ mod tests {
         match &parsed.document.sections[0].blocks[0] {
             Block::Paragraph(paragraph) => {
                 assert_eq!(
-                    paragraph.runs.iter().map(|run| run.text.as_str()).collect::<String>(),
+                    paragraph
+                        .runs
+                        .iter()
+                        .map(|run| run.text.as_str())
+                        .collect::<String>(),
                     "ABCDE\nFGHIJ"
+                );
+            }
+            _ => panic!("expected body paragraph"),
+        }
+    }
+
+    #[test]
+    fn strips_object_placeholder_characters_from_text_runs() {
+        let bytes = fixture_hwpx_bytes_with_section(
+            "application/hwpx+zip",
+            br#"<hp:section xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+<hp:p paraPrIDRef="20">
+  <hp:run charPrIDRef="7"><hp:t>&#xFFFC;Project Title</hp:t></hp:run>
+</hp:p>
+</hp:section>"#,
+        );
+
+        let parsed = HwpxInspector
+            .parse_bytes(&bytes, Some("fixture.hwpx"))
+            .expect("fixture should parse");
+
+        match &parsed.document.sections[0].blocks[0] {
+            Block::Paragraph(paragraph) => {
+                assert_eq!(
+                    paragraph
+                        .runs
+                        .iter()
+                        .map(|run| run.text.as_str())
+                        .collect::<String>(),
+                    "Project Title"
                 );
             }
             _ => panic!("expected body paragraph"),

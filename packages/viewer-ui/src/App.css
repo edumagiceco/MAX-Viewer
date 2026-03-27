@@ -7,9 +7,25 @@
 .topbar {
   display: flex;
   justify-content: space-between;
-  align-items: flex-end;
+  align-items: flex-start;
   gap: 1rem;
   margin-bottom: 1rem;
+}
+
+.brand-lockup {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.brand-mark {
+  width: 4.75rem;
+  height: 4.75rem;
+  flex: 0 0 auto;
+}
+
+.title-wrap {
+  min-width: 0;
 }
 
 .title-wrap h1 {
@@ -31,6 +47,17 @@
   margin: 0.65rem 0 0;
   color: #cbd5e1;
   font-size: 1rem;
+}
+
+@media (max-width: 720px) {
+  .brand-lockup {
+    align-items: flex-start;
+  }
+
+  .brand-mark {
+    width: 3.85rem;
+    height: 3.85rem;
+  }
 }
 
 .toolbar {

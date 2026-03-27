@@ -57,7 +57,7 @@ fn app_info() -> DesktopAppInfo {
             blocks: vec![Block::Paragraph(Paragraph {
                 marker: None,
                 runs: vec![TextRun {
-                    text: "MAX-Viewer workspace is wired and ready for parser work.".to_string(),
+                    text: "MAX Viewer workspace is wired and ready for parser work.".to_string(),
                     style: None,
                 }],
                 style: None,

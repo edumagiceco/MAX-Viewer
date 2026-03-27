@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "MAX-Viewer",
+  "productName": "MAX Viewer",
   "version": "0.1.0",
-  "identifier": "com.maxviewer.app",
+  "identifier": "com.maxviewer.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev:web",
     "beforeBuildCommand": "pnpm build:web",
@@ -10,13 +10,17 @@
     "frontendDist": "../../../packages/viewer-ui/dist"
   },
   "bundle": {
-    "active": false
+    "active": false,
+    "icon": [
+      "icons/icon.icns",
+      "icons/icon.png"
+    ]
   },
   "app": {
     "windows": [
       {
         "label": "main",
-        "title": "MAX-Viewer",
+        "title": "MAX Viewer",
         "width": 1440,
         "height": 920,
         "minWidth": 1120,
