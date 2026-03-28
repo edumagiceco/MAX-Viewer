@@ -1,0 +1,17 @@
+[package]
+name = "max_viewer_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "max-viewer"
+path = "src/main.rs"
+
+[dependencies]
+max_viewer_core.workspace = true
+max_viewer_hwpx.workspace = true
+max_viewer_hwp.workspace = true
+max_viewer_export.workspace = true
+serde_json.workspace = true

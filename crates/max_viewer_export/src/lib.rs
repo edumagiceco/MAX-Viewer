@@ -52,6 +52,17 @@ fn write_block_text(block: &Block, output: &mut String) {
             }
             output.push('\n');
         }
+        Block::Footnote(footnote) => {
+            output.push_str("[");
+            output.push_str(&footnote.kind);
+            if let Some(num) = footnote.number {
+                output.push_str(&format!(" {}", num));
+            }
+            output.push_str("] ");
+            for nested_block in &footnote.blocks {
+                write_block_text(nested_block, output);
+            }
+        }
         Block::Unsupported(unsupported) => {
             output.push_str("[unsupported] ");
             output.push_str(&unsupported.kind);

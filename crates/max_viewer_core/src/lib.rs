@@ -64,6 +64,8 @@ pub struct ParagraphStyle {
     pub marker_width_adjust: Option<i32>,
     pub marker_text_offset_type: Option<String>,
     pub marker_text_offset: Option<i32>,
+    pub keep_with_next: bool,
+    pub keep_lines: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -72,7 +74,38 @@ pub struct Paragraph {
     pub marker: Option<TextRun>,
     pub runs: Vec<TextRun>,
     pub style: Option<ParagraphStyle>,
+    pub line_segment_count: Option<u32>,
+    pub layout_height_hint: Option<i32>,
     pub page_break_before: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TableBorder {
+    pub style: Option<String>,
+    pub width: Option<String>,
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TableDiagonal {
+    pub style: Option<String>,
+    pub width: Option<String>,
+    pub color: Option<String>,
+    pub slash_type: Option<String>,
+    pub back_slash_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TableCellStyle {
+    pub background_color: Option<String>,
+    pub border_left: Option<TableBorder>,
+    pub border_right: Option<TableBorder>,
+    pub border_top: Option<TableBorder>,
+    pub border_bottom: Option<TableBorder>,
+    pub diagonal: Option<TableDiagonal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -88,6 +121,7 @@ pub struct TableCell {
     pub padding_right: Option<i32>,
     pub padding_top: Option<i32>,
     pub padding_bottom: Option<i32>,
+    pub style: Option<TableCellStyle>,
     pub is_header: bool,
 }
 
@@ -104,7 +138,10 @@ pub struct TableBlock {
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub cell_spacing: Option<i32>,
+    pub style: Option<TableCellStyle>,
+    pub no_adjust: bool,
     pub repeat_header: bool,
+    pub header_row_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -126,7 +163,20 @@ pub struct ImageBlock {
     pub horz_align: Option<String>,
     pub vert_offset: Option<i32>,
     pub horz_offset: Option<i32>,
+    pub distance_left: Option<i32>,
+    pub distance_right: Option<i32>,
+    pub distance_top: Option<i32>,
+    pub distance_bottom: Option<i32>,
+    pub rotation: Option<i32>,
     pub caption: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct FootnoteBlock {
+    pub kind: String,
+    pub number: Option<u32>,
+    pub blocks: Vec<Block>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -142,6 +192,7 @@ pub enum Block {
     Paragraph(Paragraph),
     Table(TableBlock),
     Image(ImageBlock),
+    Footnote(FootnoteBlock),
     Unsupported(UnsupportedBlock),
 }
 
@@ -158,6 +209,7 @@ pub struct PageLayout {
     pub margin_header: Option<i32>,
     pub margin_footer: Option<i32>,
     pub margin_gutter: Option<i32>,
+    pub page_border: Option<TableCellStyle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

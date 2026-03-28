@@ -40,6 +40,11 @@ fn accumulate_block_summary(block: &Block, summary: &mut LayoutSummary) {
             }
         }
         Block::Image(_) => summary.image_count += 1,
+        Block::Footnote(footnote) => {
+            for nested_block in &footnote.blocks {
+                accumulate_block_summary(nested_block, summary);
+            }
+        }
         Block::Unsupported(_) => summary.unsupported_count += 1,
     }
 }

@@ -41,7 +41,7 @@ MAX-Viewer/
 - `max_viewer_layout`: 문서 블록 수 기반 레이아웃 요약
 - `max_viewer_export`: 내부 문서 모델의 텍스트 추출 스캐폴드
 - `apps/desktop-tauri`: Tauri 명령, 네이티브 파일 열기 다이얼로그, 실제 문서 로드 셸
-- `packages/viewer-ui`: 네이티브 문서 열기, 페이지 분할, 실제 이미지 렌더링, 표 셀 내부 조판, floating 개체 배치가 연결된 뷰어 UI
+- `packages/viewer-ui`: 네이티브 문서 열기, `keepWithNext`/`keepLines`/`lineSegArray` 기반 페이지 분할, 복잡한 표 행 단위 분할, 실제 이미지 렌더링, 표 셀 내부 조판, floating 개체 footprint reflow가 연결된 뷰어 UI
 
 세부 설계는 [docs/README.md](/Users/magic/work/MAX-Viewer/docs/README.md)에 정리되어 있습니다.
 

@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+base64.workspace = true
 cfb.workspace = true
 flate2.workspace = true
 max_viewer_core.workspace = true

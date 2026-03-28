@@ -6,6 +6,8 @@ members = [
   "crates/max_viewer_layout",
   "crates/max_viewer_export",
   "apps/desktop-tauri/src-tauri",
+  "apps/cli",
+  "apps/wasm",
 ]
 resolver = "2"
 

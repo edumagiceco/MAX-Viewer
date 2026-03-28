@@ -9,7 +9,7 @@ use max_viewer_core::{
 use max_viewer_export::to_plain_text;
 use max_viewer_hwp::HwpInspector;
 use max_viewer_hwpx::HwpxInspector;
-use max_viewer_layout::{summarize, LayoutSummary};
+use max_viewer_layout::{LayoutSummary, summarize};
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -61,6 +61,8 @@ fn app_info() -> DesktopAppInfo {
                     style: None,
                 }],
                 style: None,
+                line_segment_count: None,
+                layout_height_hint: None,
                 page_break_before: false,
             })],
             page_layout: None,

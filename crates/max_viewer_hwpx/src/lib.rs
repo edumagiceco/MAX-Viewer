@@ -4,11 +4,12 @@ use std::{
     path::Path,
 };
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use max_viewer_core::{
     AssetRef, Block, Document, DocumentDiagnostics, DocumentFormat, DocumentMetadata,
     FormatInspector, FormatSupport, HeaderFooter, ImageBlock, PageLayout, Paragraph,
-    ParagraphStyle, ParseError, Section, TableBlock, TableCell, TableRow, TextRun, TextStyle,
+    ParagraphStyle, ParseError, Section, TableBlock, TableBorder, TableCell, TableCellStyle,
+    TableDiagonal, TableRow, TextRun, TextStyle,
 };
 use roxmltree::{Document as XmlDocument, Node};
 use zip::read::ZipArchive;
@@ -29,6 +30,7 @@ struct HwpxStyleResolver {
     named_styles: BTreeMap<u32, NamedStyleRef>,
     numberings: BTreeMap<u32, NumberingDefinition>,
     bullets: BTreeMap<u32, BulletDefinition>,
+    border_fills: BTreeMap<u32, TableCellStyle>,
     begin_page: Option<u32>,
 }
 
@@ -66,11 +68,19 @@ struct ParaHeadDefinition {
 #[derive(Debug, Default)]
 struct SectionParseState {
     numbering_counters: BTreeMap<u32, Vec<u32>>,
+    footnote_counter: u32,
 }
 
 #[derive(Debug, Clone)]
 struct ParagraphMarkerResolution {
     marker: TextRun,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LineSegmentMetrics {
+    break_positions: Vec<usize>,
+    line_segment_count: Option<u32>,
+    layout_height_hint: Option<i32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -563,7 +573,18 @@ fn parse_style_resolver(header_xml: Option<&str>) -> HwpxStyleResolver {
             let Some(face) = font.attribute("face").map(str::trim) else {
                 continue;
             };
-            language_fonts.insert(id, face.to_string());
+            let resolved_face = if matches!(font.attribute("type"), Some("HFT")) {
+                font.children()
+                    .find(|child| child.is_element() && child.tag_name().name() == "substFont")
+                    .and_then(|child| child.attribute("face"))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(face)
+                    .to_string()
+            } else {
+                face.to_string()
+            };
+            language_fonts.insert(id, resolved_face);
         }
     }
 
@@ -625,6 +646,17 @@ fn parse_style_resolver(header_xml: Option<&str>) -> HwpxStyleResolver {
         })
         .collect::<BTreeMap<_, _>>();
 
+    let border_fills = document
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "borderFill")
+        .filter_map(|node| {
+            Some((
+                parse_u32_attribute(node, "id")?,
+                parse_border_fill_definition(node),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+
     let begin_page = document
         .descendants()
         .find(|node| node.is_element() && node.tag_name().name() == "beginNum")
@@ -636,6 +668,7 @@ fn parse_style_resolver(header_xml: Option<&str>) -> HwpxStyleResolver {
         named_styles,
         numberings,
         bullets,
+        border_fills,
         begin_page,
     }
 }
@@ -666,6 +699,86 @@ fn parse_bullet_definition(node: Node<'_, '_>) -> BulletDefinition {
     BulletDefinition {
         bullet_char: node.attribute("char").map(|value| value.to_string()),
         para_head,
+    }
+}
+
+fn parse_border_fill_definition(node: Node<'_, '_>) -> TableCellStyle {
+    let fill_color = node
+        .descendants()
+        .find(|child| child.is_element() && child.tag_name().name() == "winBrush")
+        .and_then(|child| child.attribute("faceColor"))
+        .and_then(normalize_color_value);
+    let slash_type = node
+        .children()
+        .find(|child| child.is_element() && child.tag_name().name() == "slash")
+        .and_then(|child| child.attribute("type"))
+        .map(|value| value.to_string());
+    let back_slash_type = node
+        .children()
+        .find(|child| child.is_element() && child.tag_name().name() == "backSlash")
+        .and_then(|child| child.attribute("type"))
+        .map(|value| value.to_string());
+    let diagonal = node
+        .children()
+        .find(|child| child.is_element() && child.tag_name().name() == "diagonal");
+    let diagonal_style = diagonal
+        .and_then(|child| child.attribute("type"))
+        .map(|value| value.to_string());
+    let diagonal_width = diagonal
+        .and_then(|child| child.attribute("width"))
+        .map(|value| value.trim().to_string());
+    let diagonal_color = diagonal
+        .and_then(|child| child.attribute("color"))
+        .and_then(normalize_color_value);
+    let has_diagonal_direction = slash_type.as_deref().is_some_and(|value| value != "NONE")
+        || back_slash_type
+            .as_deref()
+            .is_some_and(|value| value != "NONE");
+    let has_diagonal_style = diagonal_style
+        .as_deref()
+        .is_some_and(|value| value != "NONE")
+        || diagonal_width.is_some()
+        || diagonal_color.is_some();
+
+    TableCellStyle {
+        background_color: fill_color,
+        border_left: node
+            .children()
+            .find(|child| child.is_element() && child.tag_name().name() == "leftBorder")
+            .map(parse_table_border),
+        border_right: node
+            .children()
+            .find(|child| child.is_element() && child.tag_name().name() == "rightBorder")
+            .map(parse_table_border),
+        border_top: node
+            .children()
+            .find(|child| child.is_element() && child.tag_name().name() == "topBorder")
+            .map(parse_table_border),
+        border_bottom: node
+            .children()
+            .find(|child| child.is_element() && child.tag_name().name() == "bottomBorder")
+            .map(parse_table_border),
+        diagonal: if has_diagonal_direction || has_diagonal_style {
+            Some(TableDiagonal {
+                style: diagonal_style,
+                width: diagonal_width,
+                color: diagonal_color,
+                slash_type,
+                back_slash_type,
+            })
+        } else {
+            None
+        },
+    }
+}
+
+fn parse_table_border(node: Node<'_, '_>) -> TableBorder {
+    TableBorder {
+        style: node.attribute("type").map(|value| value.to_string()),
+        width: node
+            .attribute("width")
+            .map(|value| value.trim().to_string()),
+        color: node.attribute("color").and_then(normalize_color_value),
     }
 }
 
@@ -705,7 +818,7 @@ fn parse_section_document(
     Ok(Section {
         id: section_id,
         blocks,
-        page_layout: parse_page_layout(root),
+        page_layout: parse_page_layout(root, style_resolver),
         headers: parse_header_footers(root, "header", style_resolver),
         footers: parse_header_footers(root, "footer", style_resolver),
         page_start_number: style_resolver.begin_page,
@@ -722,8 +835,23 @@ fn collect_blocks(
     for child in node.children().filter(|node| node.is_element()) {
         match child.tag_name().name() {
             "p" => {
+                let embedded_blocks = collect_embedded_blocks_from_paragraph(
+                    child,
+                    style_resolver,
+                    asset_lookup,
+                    state,
+                );
                 if let Some(paragraph) = parse_paragraph(child, style_resolver, state) {
-                    blocks.push(Block::Paragraph(paragraph));
+                    let suppress_paragraph = !embedded_blocks.is_empty()
+                        && !paragraph_has_visible_text(&paragraph)
+                        && paragraph.marker.is_none()
+                        && !paragraph.page_break_before;
+                    if !suppress_paragraph {
+                        blocks.push(Block::Paragraph(paragraph));
+                    }
+                }
+                for embedded_block in embedded_blocks {
+                    blocks.push(embedded_block);
                 }
             }
             "tbl" => {
@@ -738,10 +866,77 @@ fn collect_blocks(
                     blocks.push(Block::Image(image));
                 }
             }
+            "fn" | "endnote" => {
+                let kind = child.tag_name().name().to_string();
+                let mut fn_blocks = Vec::new();
+                collect_blocks(child, style_resolver, asset_lookup, state, &mut fn_blocks);
+                let number = state.footnote_counter;
+                state.footnote_counter += 1;
+                blocks.push(Block::Footnote(max_viewer_core::FootnoteBlock {
+                    kind,
+                    number: Some(number),
+                    blocks: fn_blocks,
+                }));
+            }
             "header" | "footer" => {}
             _ => collect_blocks(child, style_resolver, asset_lookup, state, blocks),
         }
     }
+}
+
+fn paragraph_has_visible_text(paragraph: &Paragraph) -> bool {
+    paragraph
+        .runs
+        .iter()
+        .any(|run| run.text.chars().any(|ch| !ch.is_whitespace()))
+}
+
+fn collect_embedded_blocks_from_paragraph(
+    paragraph_node: Node<'_, '_>,
+    style_resolver: &HwpxStyleResolver,
+    asset_lookup: &BTreeMap<String, String>,
+    state: &mut SectionParseState,
+) -> Vec<Block> {
+    paragraph_node
+        .descendants()
+        .filter(|node| node.is_element() && is_embedded_block_tag(node.tag_name().name()))
+        .filter(|node| !has_embedded_block_ancestor(*node, paragraph_node))
+        .filter_map(|node| match node.tag_name().name() {
+            "tbl" => {
+                let table = parse_table(node, style_resolver, asset_lookup, state);
+                (!table.rows.is_empty()).then_some(Block::Table(table))
+            }
+            _ => parse_image(node, asset_lookup).map(Block::Image),
+        })
+        .collect()
+}
+
+fn has_embedded_block_ancestor(node: Node<'_, '_>, paragraph_node: Node<'_, '_>) -> bool {
+    node.ancestors()
+        .skip(1)
+        .take_while(|ancestor| *ancestor != paragraph_node)
+        .any(|ancestor| ancestor.is_element() && is_embedded_block_tag(ancestor.tag_name().name()))
+}
+
+fn is_embedded_block_tag(tag_name: &str) -> bool {
+    matches!(
+        tag_name,
+        "tbl"
+            | "pic"
+            | "img"
+            | "image"
+            | "ole"
+            | "rect"
+            | "ellipse"
+            | "line"
+            | "connectLine"
+            | "arc"
+            | "curve"
+            | "polygon"
+            | "container"
+            | "textart"
+            | "equation"
+    )
 }
 
 fn parse_paragraph(
@@ -752,9 +947,9 @@ fn parse_paragraph(
     let mut paragraph_style = resolve_paragraph_style(node, style_resolver);
     let default_run_style = resolve_default_text_style(node, style_resolver);
     let mut runs = parse_paragraph_runs(node, style_resolver, default_run_style);
-    let line_break_positions = parse_line_break_positions(node);
-    if !line_break_positions.is_empty() {
-        runs = inject_line_breaks_into_runs(runs, &line_break_positions);
+    let line_segments = parse_line_segment_metrics(node);
+    if !line_segments.break_positions.is_empty() {
+        runs = inject_line_breaks_into_runs(runs, &line_segments.break_positions);
     }
 
     let marker_resolution =
@@ -763,6 +958,8 @@ fn parse_paragraph(
         marker: marker_resolution.map(|resolution| resolution.marker),
         runs,
         style: paragraph_style,
+        line_segment_count: line_segments.line_segment_count,
+        layout_height_hint: line_segments.layout_height_hint,
         page_break_before: node
             .attribute("pageBreak")
             .map(|value| matches!(value.trim(), "1" | "true" | "TRUE"))
@@ -808,25 +1005,52 @@ fn parse_paragraph_runs(
     runs
 }
 
-fn parse_line_break_positions(paragraph_node: Node<'_, '_>) -> Vec<usize> {
-    let mut positions = paragraph_node
+fn parse_line_segment_metrics(paragraph_node: Node<'_, '_>) -> LineSegmentMetrics {
+    let mut positions = Vec::new();
+    let mut count = 0u32;
+    let mut min_top = None::<i32>;
+    let mut max_bottom = None::<i32>;
+
+    if let Some(line_seg_array) = paragraph_node
         .children()
         .find(|node| node.is_element() && node.tag_name().name() == "linesegarray")
-        .into_iter()
-        .flat_map(|line_seg_array| {
-            line_seg_array
-                .children()
-                .filter(|child| child.is_element() && child.tag_name().name() == "lineseg")
-                .filter_map(|line_seg| {
-                    parse_u32_attribute(line_seg, "textpos").map(|value| value as usize)
-                })
-        })
-        .collect::<Vec<_>>();
+    {
+        line_seg_array
+            .children()
+            .filter(|child| child.is_element() && child.tag_name().name() == "lineseg")
+            .for_each(|line_seg| {
+                if let Some(position) = parse_u32_attribute(line_seg, "textpos") {
+                    positions.push(position as usize);
+                }
+
+                count += 1;
+
+                let vertpos = parse_i32_attribute(line_seg, "vertpos").unwrap_or(0);
+                let vertsize = parse_i32_attribute(line_seg, "vertsize").unwrap_or(0);
+                let textheight = parse_i32_attribute(line_seg, "textheight").unwrap_or(0);
+                let spacing = parse_i32_attribute(line_seg, "spacing").unwrap_or(0);
+                let bottom = vertpos + vertsize.max(textheight) + spacing.max(0);
+                min_top = Some(min_top.map_or(vertpos, |current| current.min(vertpos)));
+                max_bottom = Some(max_bottom.map_or(bottom, |current| current.max(bottom)));
+            });
+    }
 
     positions.sort_unstable();
     positions.dedup();
     positions.retain(|position| *position > 0);
-    positions
+
+    // lineseg vertpos values are absolute positions within the section.
+    // Subtract the first line's vertpos to get the paragraph's own height.
+    let layout_height_hint = match (min_top, max_bottom) {
+        (Some(top), Some(bottom)) if bottom > top => Some(bottom - top),
+        _ => None,
+    };
+
+    LineSegmentMetrics {
+        break_positions: positions,
+        line_segment_count: (count > 0).then_some(count),
+        layout_height_hint,
+    }
 }
 
 fn inject_line_breaks_into_runs(
@@ -1151,7 +1375,10 @@ fn parse_header_footers(
         .collect()
 }
 
-fn parse_page_layout(section_root: Node<'_, '_>) -> Option<PageLayout> {
+fn parse_page_layout(
+    section_root: Node<'_, '_>,
+    style_resolver: &HwpxStyleResolver,
+) -> Option<PageLayout> {
     let sec_pr = section_root
         .descendants()
         .find(|node| node.is_element() && node.tag_name().name() == "secPr")?;
@@ -1162,21 +1389,31 @@ fn parse_page_layout(section_root: Node<'_, '_>) -> Option<PageLayout> {
         .children()
         .find(|node| node.is_element() && node.tag_name().name() == "margin");
 
-    let mut width = parse_i32_attribute(page_pr, "width");
-    let mut height = parse_i32_attribute(page_pr, "height");
+    let width = parse_i32_attribute(page_pr, "width");
+    let height = parse_i32_attribute(page_pr, "height");
     let landscape = matches!(
         page_pr.attribute("landscape").map(|value| value.trim()),
         Some("WIDELY")
     );
 
-    if landscape {
-        if let (Some(current_width), Some(current_height)) = (width, height) {
-            if current_width < current_height {
-                width = Some(current_height);
-                height = Some(current_width);
-            }
-        }
-    }
+    // NOTE: Do NOT swap width/height based on landscape flag.
+    // In HWPX, the width and height values in pagePr represent the actual
+    // visual page dimensions as laid out, regardless of the landscape flag.
+    // Many documents set landscape="WIDELY" even for portrait pages.
+
+    // Parse pageBorderFill for the "BOTH" page type (applies to all pages).
+    let page_border = sec_pr
+        .children()
+        .filter(|node| node.is_element() && node.tag_name().name() == "pageBorderFill")
+        .find(|node| {
+            matches!(
+                node.attribute("type").map(|v| v.trim()),
+                Some("BOTH") | None
+            )
+        })
+        .and_then(|node| parse_u32_attribute(node, "borderFillIDRef"))
+        .and_then(|id| style_resolver.border_fills.get(&id))
+        .cloned();
 
     Some(PageLayout {
         width,
@@ -1189,6 +1426,7 @@ fn parse_page_layout(section_root: Node<'_, '_>) -> Option<PageLayout> {
         margin_header: margin.and_then(|node| parse_i32_attribute(node, "header")),
         margin_footer: margin.and_then(|node| parse_i32_attribute(node, "footer")),
         margin_gutter: margin.and_then(|node| parse_i32_attribute(node, "gutter")),
+        page_border,
     })
 }
 
@@ -1294,6 +1532,9 @@ fn parse_paragraph_style_definition(node: Node<'_, '_>) -> ParagraphStyle {
     let heading = node
         .children()
         .find(|child| child.is_element() && child.tag_name().name() == "heading");
+    let break_setting = node
+        .children()
+        .find(|child| child.is_element() && child.tag_name().name() == "breakSetting");
 
     ParagraphStyle {
         align,
@@ -1315,6 +1556,12 @@ fn parse_paragraph_style_definition(node: Node<'_, '_>) -> ParagraphStyle {
         marker_width_adjust: None,
         marker_text_offset_type: None,
         marker_text_offset: None,
+        keep_with_next: break_setting
+            .map(|break_setting| parse_bool_attribute(break_setting, "keepWithNext"))
+            .unwrap_or(false),
+        keep_lines: break_setting
+            .map(|break_setting| parse_bool_attribute(break_setting, "keepLines"))
+            .unwrap_or(false),
     }
 }
 
@@ -1382,12 +1629,28 @@ fn parse_table(
     collect_rows(node, style_resolver, asset_lookup, state, &mut rows);
     let (width, height, _, _) = parse_size_attributes(node);
 
+    let repeat_header = parse_bool_attribute(node, "repeatHeader");
+    let header_row_count = if repeat_header {
+        let count = rows
+            .iter()
+            .take_while(|row| row.cells.iter().any(|cell| cell.is_header))
+            .count() as u32;
+        Some(if count > 0 { count } else { 1 })
+    } else {
+        None
+    };
+
     TableBlock {
         rows,
         width,
         height,
         cell_spacing: parse_i32_attribute(node, "cellSpacing"),
-        repeat_header: parse_bool_attribute(node, "repeatHeader"),
+        style: parse_u32_attribute(node, "borderFillIDRef")
+            .and_then(|border_fill_id| style_resolver.border_fills.get(&border_fill_id))
+            .cloned(),
+        no_adjust: parse_bool_attribute(node, "noAdjust"),
+        repeat_header,
+        header_row_count,
     }
 }
 
@@ -1459,6 +1722,9 @@ fn parse_cell(
     let cell_margin = node
         .children()
         .find(|child| child.is_element() && child.tag_name().name() == "cellMargin");
+    let cell_style = parse_u32_attribute(node, "borderFillIDRef")
+        .and_then(|border_fill_id| style_resolver.border_fills.get(&border_fill_id))
+        .cloned();
 
     TableCell {
         text: blocks_to_plain_text(&blocks).unwrap_or_else(|| collect_text(node)),
@@ -1471,6 +1737,7 @@ fn parse_cell(
         padding_right: cell_margin.and_then(|margin| parse_i32_attribute(margin, "right")),
         padding_top: cell_margin.and_then(|margin| parse_i32_attribute(margin, "top")),
         padding_bottom: cell_margin.and_then(|margin| parse_i32_attribute(margin, "bottom")),
+        style: cell_style,
         is_header: parse_bool_attribute(node, "header"),
     }
 }
@@ -1486,6 +1753,10 @@ fn parse_image(node: Node<'_, '_>, asset_lookup: &BTreeMap<String, String>) -> O
     let position = parse_position_attributes(node);
     let caption = parse_caption_text(node);
     let kind = node.tag_name().name().to_string();
+
+    let out_margin_node = node
+        .children()
+        .find(|child| child.is_element() && child.tag_name().name() == "outMargin");
 
     Some(ImageBlock {
         kind: kind.clone(),
@@ -1517,6 +1788,11 @@ fn parse_image(node: Node<'_, '_>, asset_lookup: &BTreeMap<String, String>) -> O
             .and_then(|position| position.horz_align.clone()),
         vert_offset: position.as_ref().and_then(|position| position.vert_offset),
         horz_offset: position.as_ref().and_then(|position| position.horz_offset),
+        distance_left: out_margin_node.and_then(|n| parse_i32_attribute(n, "left")),
+        distance_right: out_margin_node.and_then(|n| parse_i32_attribute(n, "right")),
+        distance_top: out_margin_node.and_then(|n| parse_i32_attribute(n, "top")),
+        distance_bottom: out_margin_node.and_then(|n| parse_i32_attribute(n, "bottom")),
+        rotation: parse_i32_attribute(node, "rotation"),
         caption,
     })
 }
@@ -1699,6 +1975,11 @@ fn blocks_to_plain_text(blocks: &[Block]) -> Option<String> {
                 }
                 output.push('\n');
             }
+            Block::Footnote(footnote) => {
+                if let Some(text) = blocks_to_plain_text(&footnote.blocks) {
+                    output.push_str(&text);
+                }
+            }
             Block::Unsupported(unsupported) => {
                 output.push_str(&unsupported.kind);
                 output.push('\n');
@@ -1736,6 +2017,10 @@ fn collect_text_parts(node: Node<'_, '_>, output: &mut String) {
             "lineBreak" | "br" => output.push('\n'),
             "pageNum" => output.push_str(&page_placeholder_for(child)),
             "autoNum" => output.push_str(&auto_num_placeholder_for(child)),
+            tag_name if is_embedded_block_tag(tag_name) => {}
+            // Skip section properties and control elements – they contain
+            // page numbering and column controls that are not inline text.
+            "secPr" | "ctrl" => {}
             _ => collect_text_parts(child, output),
         }
     }
@@ -1744,7 +2029,17 @@ fn collect_text_parts(node: Node<'_, '_>, output: &mut String) {
 fn sanitize_text_fragment(text: &str) -> String {
     text.chars()
         .filter(|ch| should_keep_text_char(*ch))
+        .map(map_pua_char)
         .collect()
+}
+
+/// Map HWP Private Use Area characters to their standard Unicode equivalents.
+fn map_pua_char(ch: char) -> char {
+    match ch as u32 {
+        0xF0854 => '\u{300E}', // 『
+        0xF0855 => '\u{300F}', // 』
+        _ => ch,
+    }
 }
 
 fn should_keep_text_char(ch: char) -> bool {
@@ -1787,8 +2082,8 @@ fn auto_num_placeholder_for(node: Node<'_, '_>) -> String {
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
-    use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
 
     fn fixture_hwpx_bytes_with_section(mimetype: &str, section_xml: &[u8]) -> Vec<u8> {
         fixture_hwpx_bytes_with_entries(
@@ -1835,6 +2130,23 @@ mod tests {
       <hh:font id="0" face="Malgun Gothic" type="TTF" isEmbedded="0" />
     </hh:fontface>
   </hh:fontfaces>
+  <hh:borderFills itemCnt="2">
+    <hh:borderFill id="3">
+      <hh:leftBorder type="SOLID" width="0.12 mm" color="#000000" />
+      <hh:rightBorder type="SOLID" width="0.12 mm" color="#000000" />
+      <hh:topBorder type="SOLID" width="0.12 mm" color="#000000" />
+      <hh:bottomBorder type="SOLID" width="0.12 mm" color="#000000" />
+    </hh:borderFill>
+    <hh:borderFill id="4">
+      <hh:leftBorder type="SOLID" width="0.12 mm" color="#000000" />
+      <hh:rightBorder type="SOLID" width="0.12 mm" color="#000000" />
+      <hh:topBorder type="SOLID" width="0.12 mm" color="#000000" />
+      <hh:bottomBorder type="SOLID" width="0.12 mm" color="#000000" />
+      <hc:fillBrush>
+        <hc:winBrush faceColor="#C75252" />
+      </hc:fillBrush>
+    </hh:borderFill>
+  </hh:borderFills>
   <hh:charProperties>
     <hh:charPr id="7" height="1200" textColor="#6182D6">
       <hh:fontRef hangul="0" latin="0" hanja="0" japanese="0" other="0" symbol="0" user="0" />
@@ -1979,16 +2291,20 @@ mod tests {
                         .and_then(|style| style.text_color.as_deref()),
                     Some("#6182D6")
                 );
-                assert!(paragraph.runs[0]
-                    .style
-                    .as_ref()
-                    .map(|style| style.bold)
-                    .unwrap_or(false));
-                assert!(paragraph.runs[1]
-                    .style
-                    .as_ref()
-                    .map(|style| style.italic)
-                    .unwrap_or(false));
+                assert!(
+                    paragraph.runs[0]
+                        .style
+                        .as_ref()
+                        .map(|style| style.bold)
+                        .unwrap_or(false)
+                );
+                assert!(
+                    paragraph.runs[1]
+                        .style
+                        .as_ref()
+                        .map(|style| style.italic)
+                        .unwrap_or(false)
+                );
             }
             _ => panic!("expected paragraph block"),
         }
@@ -2192,6 +2508,111 @@ mod tests {
     }
 
     #[test]
+    fn extracts_tables_embedded_inside_paragraph_runs() {
+        let bytes = fixture_hwpx_bytes_with_section(
+            "application/hwpx+zip",
+            br#"<hp:section xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+<hp:p paraPrIDRef="20">
+  <hp:run charPrIDRef="7">
+    <hp:tbl repeatHeader="1" rowCnt="2" colCnt="2" cellSpacing="0">
+      <hp:tr>
+        <hp:tc>
+          <hp:subList><hp:p><hp:run><hp:t>1</hp:t></hp:run></hp:p></hp:subList>
+          <hp:cellSpan colSpan="1" rowSpan="1" />
+          <hp:cellSz width="12000" height="3600" />
+        </hp:tc>
+        <hp:tc>
+          <hp:subList><hp:p><hp:run><hp:t>2</hp:t></hp:run></hp:p></hp:subList>
+          <hp:cellSpan colSpan="1" rowSpan="2" />
+          <hp:cellSz width="12000" height="7200" />
+        </hp:tc>
+      </hp:tr>
+      <hp:tr>
+        <hp:tc>
+          <hp:subList><hp:p><hp:run><hp:t>3</hp:t></hp:run></hp:p></hp:subList>
+          <hp:cellSpan colSpan="1" rowSpan="1" />
+          <hp:cellSz width="12000" height="3600" />
+        </hp:tc>
+      </hp:tr>
+    </hp:tbl>
+  </hp:run>
+</hp:p>
+</hp:section>"#,
+        );
+
+        let parsed = HwpxInspector
+            .parse_bytes(&bytes, Some("fixture.hwpx"))
+            .expect("fixture should parse");
+
+        assert_eq!(parsed.document.sections[0].blocks.len(), 1);
+        match &parsed.document.sections[0].blocks[0] {
+            Block::Table(table) => {
+                assert_eq!(table.rows.len(), 2);
+                assert_eq!(table.rows[0].cells.len(), 2);
+                assert_eq!(table.rows[1].cells.len(), 1);
+                assert_eq!(table.rows[0].cells[1].row_span, Some(2));
+            }
+            _ => panic!("expected embedded table block"),
+        }
+    }
+
+    #[test]
+    fn suppresses_whitespace_only_paragraphs_wrapping_embedded_tables() {
+        let bytes = fixture_hwpx_bytes_with_section(
+            "application/hwpx+zip",
+            br#"<hp:section xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+<hp:p paraPrIDRef="20">
+  <hp:run charPrIDRef="7"><hp:t> </hp:t></hp:run>
+  <hp:run charPrIDRef="7">
+    <hp:tbl rowCnt="1" colCnt="1" cellSpacing="0">
+      <hp:tr>
+        <hp:tc>
+          <hp:subList><hp:p><hp:run><hp:t>Cell</hp:t></hp:run></hp:p></hp:subList>
+          <hp:cellSpan colSpan="1" rowSpan="1" />
+          <hp:cellSz width="12000" height="3600" />
+        </hp:tc>
+      </hp:tr>
+    </hp:tbl>
+  </hp:run>
+</hp:p>
+</hp:section>"#,
+        );
+
+        let parsed = HwpxInspector
+            .parse_bytes(&bytes, Some("fixture.hwpx"))
+            .expect("fixture should parse");
+
+        assert_eq!(parsed.document.sections[0].blocks.len(), 1);
+        assert!(matches!(
+            parsed.document.sections[0].blocks[0],
+            Block::Table(_)
+        ));
+    }
+
+    #[test]
+    fn parses_diagonal_table_borders() {
+        let document = XmlDocument::parse(
+            r##"<hh:borderFill xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:leftBorder type="SOLID" width="0.12 mm" color="#000000" />
+  <hh:bottomBorder type="SOLID" width="0.4 mm" color="#000000" />
+  <hh:slash type="NONE" crooked="0" isCounter="0" />
+  <hh:backSlash type="CENTER" crooked="0" isCounter="0" />
+  <hh:diagonal type="SOLID" width="0.12 mm" color="#000000" />
+</hh:borderFill>"##,
+        )
+        .expect("fixture xml should parse");
+
+        let style = parse_border_fill_definition(document.root_element());
+        let diagonal = style.diagonal.expect("diagonal should be captured");
+
+        assert_eq!(diagonal.style.as_deref(), Some("SOLID"));
+        assert_eq!(diagonal.width.as_deref(), Some("0.12 mm"));
+        assert_eq!(diagonal.color.as_deref(), Some("#000000"));
+        assert_eq!(diagonal.slash_type.as_deref(), Some("NONE"));
+        assert_eq!(diagonal.back_slash_type.as_deref(), Some("CENTER"));
+    }
+
+    #[test]
     fn parses_table_cells_and_embedded_assets() {
         let bytes = fixture_hwpx_bytes_with_entries(
             "application/hwpx+zip",
@@ -2205,10 +2626,10 @@ mod tests {
 </opf:spine>
 </opf:package>"#,
             br#"<hp:section xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
-<hp:tbl repeatHeader="1" cellSpacing="120">
+<hp:tbl repeatHeader="1" cellSpacing="120" borderFillIDRef="3">
   <hp:sz width="22000" height="8000" widthRelTo="PAGE" heightRelTo="ABSOLUTE" />
   <hp:tr>
-    <hp:tc header="1">
+    <hp:tc header="1" borderFillIDRef="4">
       <hp:cellSpan colSpan="2" rowSpan="1" />
       <hp:cellSz width="12000" height="3600" />
       <hp:cellMargin left="300" right="400" top="200" bottom="250" />
@@ -2240,12 +2661,33 @@ mod tests {
                 assert_eq!(table.width, Some(22000));
                 assert!(table.repeat_header);
                 assert_eq!(table.cell_spacing, Some(120));
+                assert_eq!(
+                    table
+                        .style
+                        .as_ref()
+                        .and_then(|style| style.border_top.as_ref())
+                        .and_then(|border| border.color.as_deref()),
+                    Some("#000000")
+                );
 
                 let cell = &table.rows[0].cells[0];
                 assert_eq!(cell.col_span, Some(2));
                 assert_eq!(cell.width, Some(12000));
                 assert_eq!(cell.padding_left, Some(300));
                 assert!(cell.is_header);
+                assert_eq!(
+                    cell.style
+                        .as_ref()
+                        .and_then(|style| style.background_color.as_deref()),
+                    Some("#C75252")
+                );
+                assert_eq!(
+                    cell.style
+                        .as_ref()
+                        .and_then(|style| style.border_left.as_ref())
+                        .and_then(|border| border.color.as_deref()),
+                    Some("#000000")
+                );
                 assert_eq!(cell.blocks.len(), 2);
 
                 match &cell.blocks[1] {
