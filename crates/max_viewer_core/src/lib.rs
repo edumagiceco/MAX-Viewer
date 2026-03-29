@@ -8,6 +8,8 @@ pub const APP_NAME: &str = "MAX Viewer";
 pub enum DocumentFormat {
     Hwp,
     Hwpx,
+    Pdf,
+    Markdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -28,6 +30,7 @@ pub struct TextStyle {
     pub font_size: Option<i32>,
     pub text_color: Option<String>,
     pub background_color: Option<String>,
+    pub underline_color: Option<String>,
     pub width_ratio: Option<i32>,
     pub letter_spacing: Option<i32>,
     pub relative_size: Option<i32>,
@@ -101,6 +104,7 @@ pub struct TableDiagonal {
 #[serde(rename_all = "camelCase")]
 pub struct TableCellStyle {
     pub background_color: Option<String>,
+    pub background_image: Option<String>,
     pub border_left: Option<TableBorder>,
     pub border_right: Option<TableBorder>,
     pub border_top: Option<TableBorder>,
@@ -142,6 +146,7 @@ pub struct TableBlock {
     pub no_adjust: bool,
     pub repeat_header: bool,
     pub header_row_count: Option<u32>,
+    pub page_break_before: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -169,6 +174,7 @@ pub struct ImageBlock {
     pub distance_bottom: Option<i32>,
     pub rotation: Option<i32>,
     pub caption: Option<String>,
+    pub page_break_before: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -177,6 +183,7 @@ pub struct FootnoteBlock {
     pub kind: String,
     pub number: Option<u32>,
     pub blocks: Vec<Block>,
+    pub page_break_before: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -184,6 +191,7 @@ pub struct FootnoteBlock {
 pub struct UnsupportedBlock {
     pub kind: String,
     pub reason: Option<String>,
+    pub page_break_before: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

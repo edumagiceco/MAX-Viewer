@@ -2,13 +2,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::process;
 
-use max_viewer_core::FormatInspector;
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("MAX Viewer CLI — HWP/HWPX 문서 변환 도구");
+        eprintln!("MAX Viewer CLI — HWP/HWPX/Markdown/PDF 문서 변환 도구");
         eprintln!();
         eprintln!("사용법:");
         eprintln!("  max-viewer <파일경로>              문서 정보 출력");
@@ -55,6 +53,26 @@ fn main() {
                 Ok(result) => (result.document, result.diagnostics),
                 Err(e) => {
                     eprintln!("HWP 파싱 실패: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        "md" | "markdown" => {
+            let inspector = max_viewer_markdown::MarkdownInspector;
+            match inspector.parse_bytes_with_base_dir(&bytes, Some(&file_name), path.parent()) {
+                Ok(result) => (result.document, result.diagnostics),
+                Err(e) => {
+                    eprintln!("Markdown 파싱 실패: {e}");
+                    process::exit(1);
+                }
+            }
+        }
+        "pdf" => {
+            let inspector = max_viewer_pdf::PdfInspector;
+            match inspector.parse_bytes(&bytes, Some(&file_name)) {
+                Ok(result) => (result.document, result.diagnostics),
+                Err(e) => {
+                    eprintln!("PDF 파싱 실패: {e}");
                     process::exit(1);
                 }
             }

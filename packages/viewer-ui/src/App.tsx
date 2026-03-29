@@ -9,16 +9,31 @@ import {
   useState,
   type CSSProperties,
 } from 'react'
+import { GlobalWorkerOptions, TextLayer, getDocument } from 'pdfjs-dist'
+import type {
+  PDFDocumentProxy,
+  PDFPageProxy,
+  RenderTask,
+  TextContent,
+  TextItem,
+} from 'pdfjs-dist/types/src/display/api'
 import './App.css'
 
-type FormatName = 'hwp' | 'hwpx'
-type ZoomPreset = 'fitWidth' | '100' | '125' | '150'
+GlobalWorkerOptions.workerSrc = new URL(
+  'pdfjs-dist/build/pdf.worker.min.mjs',
+  import.meta.url,
+).toString()
+
+type FormatName = 'hwp' | 'hwpx' | 'markdown' | 'pdf'
+type ZoomMode = 'fitWidth' | 'manual'
+type PageViewMode = 'single' | 'twoUp' | 'fourUp'
 
 type TextStyle = {
   fontFamily?: string | null
   fontSize?: number | null
   textColor?: string | null
   backgroundColor?: string | null
+  underlineColor?: string | null
   widthRatio?: number | null
   letterSpacing?: number | null
   relativeSize?: number | null
@@ -95,6 +110,7 @@ type TableDiagonal = {
 
 type TableCellStyle = {
   backgroundColor?: string | null
+  backgroundImage?: string | null
   borderLeft?: TableBorder | null
   borderRight?: TableBorder | null
   borderTop?: TableBorder | null
@@ -115,6 +131,7 @@ type TableValue = {
   noAdjust: boolean
   repeatHeader: boolean
   headerRowCount?: number | null
+  pageBreakBefore: boolean
 }
 
 type ImageValue = {
@@ -140,17 +157,20 @@ type ImageValue = {
   distanceBottom?: number | null
   rotation?: number | null
   caption?: string | null
+  pageBreakBefore: boolean
 }
 
 type UnsupportedValue = {
   kind: string
   reason?: string | null
+  pageBreakBefore: boolean
 }
 
 type FootnoteValue = {
   kind: string
   number?: number | null
   blocks: DocumentBlock[]
+  pageBreakBefore: boolean
 }
 
 type DocumentBlock =
@@ -225,15 +245,82 @@ type DetailedLayoutSummary = {
 
 type LoadedDocument = {
   fileName: string
+  filePath?: string | null
+  sourceText?: string | null
+  binaryDataUri?: string | null
+  binaryMimeType?: string | null
+  isEditable: boolean
   document: DocumentModel
   diagnostics: DocumentDiagnostics
   layout: DetailedLayoutSummary
   plainText: string
 }
 
+type PdfPageMetrics = {
+  pageNumber: number
+  width: number
+  height: number
+}
+
+type PdfPageTextIndex = {
+  pageNumber: number
+  searchableText: string
+  compactSearchableText: string
+  compactToSearchableIndex: number[]
+  itemRanges: Array<{
+    start: number
+    end: number
+    compactStart: number
+    compactEnd: number
+  }>
+}
+
+type PdfOutlineEntry = {
+  key: string
+  text: string
+  level: number
+  pageNumber: number
+}
+
+type SearchMatch = {
+  pageIndex: number
+  pageNumber: number
+  start: number
+  length: number
+  matchGlobalIndex: number
+  blockIndex?: number
+  runIndex?: number
+  itemIndexes?: number[]
+}
+
+type SearchResultPreview = {
+  matchGlobalIndex: number
+  pageNumber: number
+  before: string
+  matchText: string
+  after: string
+}
+
+type SearchNavigationRequest = {
+  index: number
+  token: number
+}
+
+type PdfSearchHighlightBox = {
+  key: string
+  left: number
+  top: number
+  width: number
+  height: number
+  matchGlobalIndex: number
+  isActive: boolean
+  isAnchor: boolean
+}
+
 type PlaceholderContext = {
   pageNumber: number
   totalPages: number
+  format?: string | null
 }
 
 type RenderedPage = {
@@ -298,12 +385,141 @@ type ParagraphSplitMeasurement = {
 
 const DEFAULT_PAGE_WIDTH = 794
 const DEFAULT_PAGE_HEIGHT = 1123
-const PAGINATION_TOLERANCE = 24
+const PAGINATION_TOLERANCE = 2
 const MIN_PARAGRAPH_FRAGMENT_LINES = 3
+const PAGE_STACK_GAP = 24
+const MIN_ZOOM_PERCENT = 40
+const MAX_ZOOM_PERCENT = 250
+const ZOOM_STEP_PERCENT = 10
+
+type ViewportPageAnchor = {
+  pageNumber: number
+  relativeOffset: number
+}
+
+type ScrollStatus = {
+  horizontalOverflow: boolean
+  horizontalProgress: number
+  verticalOverflow: boolean
+  verticalProgress: number
+}
+
+type DevFixturePayload = LoadedDocument | DocumentModel
+
+type PdfOutlineNode = NonNullable<
+  Awaited<ReturnType<PDFDocumentProxy['getOutline']>>
+>[number]
+
+function visitDocumentBlocks(
+  blocks: DocumentBlock[],
+  visit: (block: DocumentBlock) => void,
+): void {
+  for (const block of blocks) {
+    visit(block)
+    if (block.type === 'table') {
+      for (const row of block.value.rows) {
+        for (const cell of row.cells) {
+          visitDocumentBlocks(cell.blocks, visit)
+        }
+      }
+      continue
+    }
+    if (block.type === 'footnote') {
+      visitDocumentBlocks(block.value.blocks, visit)
+    }
+  }
+}
+
+function summarizeDocumentLayout(document: DocumentModel): DetailedLayoutSummary {
+  const summary: DetailedLayoutSummary = {
+    sectionCount: document.sections.length,
+    paragraphCount: 0,
+    tableCount: 0,
+    imageCount: 0,
+    unsupportedCount: 0,
+  }
+
+  for (const section of document.sections) {
+    visitDocumentBlocks(section.blocks, (block) => {
+      switch (block.type) {
+        case 'paragraph':
+          summary.paragraphCount += 1
+          break
+        case 'table':
+          summary.tableCount += 1
+          break
+        case 'image':
+          summary.imageCount += 1
+          break
+        case 'unsupported':
+          summary.unsupportedCount += 1
+          break
+        case 'footnote':
+          break
+      }
+    })
+  }
+
+  return summary
+}
+
+function collectDocumentPlainText(document: DocumentModel): string {
+  const paragraphs: string[] = []
+
+  for (const section of document.sections) {
+    visitDocumentBlocks(section.blocks, (block) => {
+      if (block.type !== 'paragraph') {
+        return
+      }
+      const text = block.value.runs.map((run) => run.text).join('').trim()
+      if (text) {
+        paragraphs.push(text)
+      }
+    })
+  }
+
+  return paragraphs.join('\n')
+}
+
+function normalizeFixtureDocument(payload: DevFixturePayload, fixtureUrl: string): LoadedDocument {
+  if ('document' in payload && 'diagnostics' in payload && 'layout' in payload && 'plainText' in payload) {
+    const loadedPayload = payload as LoadedDocument
+    return {
+      ...loadedPayload,
+      sourceText: loadedPayload.sourceText ?? null,
+      binaryDataUri: loadedPayload.binaryDataUri ?? null,
+      binaryMimeType: loadedPayload.binaryMimeType ?? null,
+      isEditable: loadedPayload.isEditable ?? loadedPayload.document.format === 'markdown',
+    }
+  }
+
+  const document = payload
+  return {
+    fileName: fixtureUrl.split('/').pop() || 'fixture.json',
+    filePath: null,
+    sourceText: null,
+    binaryDataUri: null,
+    binaryMimeType: null,
+    isEditable: document.format === 'markdown',
+    diagnostics: {
+      format: document.format ?? 'hwp',
+      sectionCount: document.sections.length,
+      isEncrypted: false,
+    },
+    layout: summarizeDocumentLayout(document),
+    plainText: collectDocumentPlainText(document),
+    document,
+  }
+}
 
 async function openWithNativeDialog(): Promise<LoadedDocument | null> {
   const { invoke } = await import('@tauri-apps/api/core')
   return await invoke<LoadedDocument | null>('pick_and_open_document')
+}
+
+async function openWithPath(filePath: string): Promise<LoadedDocument | null> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  return await invoke<LoadedDocument | null>('open_document_path', { filePath })
 }
 
 async function openWithBytes(fileName: string, bytes: Uint8Array): Promise<LoadedDocument | null> {
@@ -314,30 +530,402 @@ async function openWithBytes(fileName: string, bytes: Uint8Array): Promise<Loade
   })
 }
 
+async function parseMarkdownSource(
+  fileName: string,
+  filePath: string | null | undefined,
+  sourceText: string,
+): Promise<LoadedDocument> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  return await invoke<LoadedDocument>('parse_markdown_text', {
+    fileName,
+    filePath: filePath ?? null,
+    sourceText,
+  })
+}
+
+async function saveMarkdownSource(
+  filePath: string,
+  sourceText: string,
+): Promise<LoadedDocument> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  return await invoke<LoadedDocument>('save_markdown_document', {
+    filePath,
+    sourceText,
+  })
+}
+
+async function saveMarkdownSourceAs(
+  suggestedFileName: string,
+  sourceText: string,
+): Promise<LoadedDocument | null> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  return await invoke<LoadedDocument | null>('save_markdown_document_as', {
+    suggestedFileName,
+    sourceText,
+  })
+}
+
+async function printCurrentDocument(): Promise<void> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  await invoke('print_current_document')
+}
+
+async function extractPdfSearchText(filePath: string): Promise<string[]> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  return await invoke<string[]>('extract_pdf_search_text', { filePath })
+}
+
+async function extractPdfSearchTextBytes(bytes: Uint8Array): Promise<string[]> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  return await invoke<string[]>('extract_pdf_search_text_bytes', {
+    bytes: Array.from(bytes),
+  })
+}
+
 const RECENT_FILES_KEY = 'max-viewer-recent-files'
-const MAX_RECENT_FILES = 10
-type RecentFile = { name: string; openedAt: string }
+const MAX_RECENT_FILES = 5
+type RecentFile = { name: string; path: string; openedAt: string }
 
 function loadRecentFiles(): RecentFile[] {
   try {
     const raw = localStorage.getItem(RECENT_FILES_KEY)
-    return raw ? JSON.parse(raw) : []
+    if (!raw) {
+      return []
+    }
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) {
+      return []
+    }
+    return parsed
+      .filter(
+        (item): item is RecentFile =>
+          item &&
+          typeof item.name === 'string' &&
+          typeof item.path === 'string' &&
+          typeof item.openedAt === 'string',
+      )
+      .slice(0, MAX_RECENT_FILES)
   } catch {
     return []
   }
 }
 
-function saveRecentFile(name: string): void {
-  const recent = loadRecentFiles().filter((f) => f.name !== name)
-  recent.unshift({ name, openedAt: new Date().toISOString() })
+function saveRecentFile(name: string, path?: string | null): void {
+  if (!path) {
+    return
+  }
+  const recent = loadRecentFiles().filter((f) => f.path !== path)
+  recent.unshift({ name, path, openedAt: new Date().toISOString() })
   if (recent.length > MAX_RECENT_FILES) recent.length = MAX_RECENT_FILES
   try {
     localStorage.setItem(RECENT_FILES_KEY, JSON.stringify(recent))
   } catch { /* ignore quota errors */ }
 }
 
+function removeRecentFile(path: string): void {
+  const recent = loadRecentFiles().filter((file) => file.path !== path)
+  try {
+    localStorage.setItem(RECENT_FILES_KEY, JSON.stringify(recent))
+  } catch { /* ignore quota errors */ }
+}
+
 function formatLabel(format?: FormatName | null): string {
+  if (format === 'markdown') {
+    return 'MD'
+  }
   return format?.toUpperCase() ?? 'Unknown'
+}
+
+function resolvedDocumentFormat(document: LoadedDocument | null | undefined): FormatName | undefined {
+  return document?.document.format ?? document?.diagnostics.format
+}
+
+function isMarkdownDocument(document: LoadedDocument | null | undefined): boolean {
+  return resolvedDocumentFormat(document) === 'markdown'
+}
+
+function isPdfDocument(document: LoadedDocument | null | undefined): boolean {
+  return resolvedDocumentFormat(document) === 'pdf'
+}
+
+function markdownDocumentIdentity(document: LoadedDocument): string {
+  return document.filePath ?? `memory:${document.fileName}`
+}
+
+function decodeDataUriToBytes(dataUri: string): Uint8Array {
+  const commaIndex = dataUri.indexOf(',')
+  const encoded = commaIndex >= 0 ? dataUri.slice(commaIndex + 1) : dataUri
+  const binary = window.atob(encoded)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return bytes
+}
+
+function isPdfTextItem(item: TextContent['items'][number]): item is TextItem {
+  return 'str' in item
+}
+
+function normalizeSearchText(text: string): string {
+  let normalized = ''
+  let pendingWhitespace = false
+
+  for (const char of text.normalize('NFC').toLowerCase()) {
+    if (/\s/u.test(char)) {
+      pendingWhitespace = normalized.length > 0
+      continue
+    }
+
+    if (pendingWhitespace) {
+      normalized += ' '
+      pendingWhitespace = false
+    }
+
+    normalized += char
+  }
+
+  return normalized
+}
+
+function compactPdfSearchText(text: string): string {
+  return normalizeSearchText(text).replaceAll(' ', '')
+}
+
+function buildPlainTextSearchIndex(text: string): {
+  searchableText: string
+  compactSearchableText: string
+  compactToSearchableIndex: number[]
+} {
+  const searchableFragments: string[] = []
+  const compactFragments: string[] = []
+  const compactToSearchableIndex: number[] = []
+  let searchableCursor = 0
+  let compactCursor = 0
+  let endsWithWhitespace = true
+
+  for (const char of text.normalize('NFC').toLowerCase()) {
+    const charLength = char.length
+    if (/\s/u.test(char)) {
+      if (!endsWithWhitespace && searchableCursor > 0) {
+        searchableFragments.push(' ')
+        searchableCursor += 1
+        endsWithWhitespace = true
+      }
+      continue
+    }
+
+    searchableFragments.push(char)
+    const searchableStart = searchableCursor
+    searchableCursor += charLength
+    endsWithWhitespace = false
+
+    compactFragments.push(char)
+    for (let offset = 0; offset < charLength; offset += 1) {
+      compactToSearchableIndex[compactCursor + offset] = searchableStart + offset
+    }
+    compactCursor += charLength
+  }
+
+  return {
+    searchableText: searchableFragments.join(''),
+    compactSearchableText: compactFragments.join(''),
+    compactToSearchableIndex,
+  }
+}
+
+function buildSearchSnippet(
+  text: string,
+  start: number,
+  length: number,
+): Pick<SearchResultPreview, 'before' | 'matchText' | 'after'> {
+  const snippetRadius = 26
+  const snippetStart = Math.max(0, start - snippetRadius)
+  const snippetEnd = Math.min(text.length, start + length + snippetRadius)
+  const beforePrefix = snippetStart > 0 ? '…' : ''
+  const afterSuffix = snippetEnd < text.length ? '…' : ''
+
+  return {
+    before: `${beforePrefix}${text.slice(snippetStart, start).trimStart()}`,
+    matchText: text.slice(start, start + length),
+    after: `${text.slice(start + length, snippetEnd).trimEnd()}${afterSuffix}`,
+  }
+}
+
+function buildPdfPageTextIndex(pageNumber: number, textContent: TextContent): PdfPageTextIndex {
+  const searchableFragments: string[] = []
+  const compactFragments: string[] = []
+  const compactToSearchableIndex: number[] = []
+  const itemRanges: PdfPageTextIndex['itemRanges'] = []
+  let searchableCursor = 0
+  let compactCursor = 0
+  let endsWithWhitespace = true
+
+  const appendNormalized = (text: string) => {
+    for (const char of text.normalize('NFC').toLowerCase()) {
+      const charLength = char.length
+      if (/\s/u.test(char)) {
+        if (!endsWithWhitespace && searchableCursor > 0) {
+          searchableFragments.push(' ')
+          searchableCursor += 1
+          endsWithWhitespace = true
+        }
+        continue
+      }
+
+      searchableFragments.push(char)
+      const searchableStart = searchableCursor
+      searchableCursor += charLength
+      endsWithWhitespace = false
+
+      compactFragments.push(char)
+      for (let offset = 0; offset < charLength; offset += 1) {
+        compactToSearchableIndex[compactCursor + offset] = searchableStart + offset
+      }
+      compactCursor += charLength
+    }
+  }
+
+  for (const item of textContent.items) {
+    if (!isPdfTextItem(item)) {
+      continue
+    }
+    const start = searchableCursor
+    const compactStart = compactCursor
+    appendNormalized(item.str)
+    itemRanges.push({
+      start,
+      end: searchableCursor,
+      compactStart,
+      compactEnd: compactCursor,
+    })
+
+    if (item.hasEOL) {
+      appendNormalized(' ')
+    }
+  }
+
+  return {
+    pageNumber,
+    searchableText: searchableFragments.join(''),
+    compactSearchableText: compactFragments.join(''),
+    compactToSearchableIndex,
+    itemRanges,
+  }
+}
+
+function findPdfMatchItemIndexes(
+  itemRanges: PdfPageTextIndex['itemRanges'],
+  matchStart: number,
+  matchEnd: number,
+): number[] {
+  const indexes: number[] = []
+
+  itemRanges.forEach((range, itemIndex) => {
+    if (range.compactEnd <= matchStart || range.compactStart >= matchEnd) {
+      return
+    }
+    indexes.push(itemIndex)
+  })
+
+  return indexes
+}
+
+function resolvePdfSearchableRange(
+  compactToSearchableIndex: number[],
+  compactStart: number,
+  compactLength: number,
+): { start: number; length: number } {
+  if (compactLength <= 0 || compactToSearchableIndex.length === 0) {
+    return { start: 0, length: 0 }
+  }
+
+  const start = compactToSearchableIndex[compactStart] ?? 0
+  const end = (compactToSearchableIndex[compactStart + compactLength - 1] ?? start) + 1
+  return {
+    start,
+    length: Math.max(0, end - start),
+  }
+}
+
+async function resolvePdfDestinationPageNumber(
+  pdfDocument: PDFDocumentProxy,
+  destination: string | Array<unknown> | null,
+  pageIndexCache: Map<string, number>,
+): Promise<number | null> {
+  if (!destination) {
+    return null
+  }
+
+  const explicitDestination = Array.isArray(destination)
+    ? destination
+    : await pdfDocument.getDestination(destination)
+  if (!explicitDestination || explicitDestination.length === 0) {
+    return null
+  }
+
+  const target = explicitDestination[0]
+  if (typeof target === 'number' && Number.isFinite(target)) {
+    return target + 1
+  }
+
+  if (target && typeof target === 'object' && 'num' in target && 'gen' in target) {
+    const ref = target as { num: number; gen: number }
+    const cacheKey = `${ref.num}:${ref.gen}`
+    const cached = pageIndexCache.get(cacheKey)
+    if (cached != null) {
+      return cached + 1
+    }
+
+    try {
+      const pageIndex = await pdfDocument.getPageIndex(target as any)
+      pageIndexCache.set(cacheKey, pageIndex)
+      return pageIndex + 1
+    } catch {
+      return null
+    }
+  }
+
+  return null
+}
+
+async function flattenPdfOutlineEntries(
+  pdfDocument: PDFDocumentProxy,
+  outline: Awaited<ReturnType<PDFDocumentProxy['getOutline']>>,
+): Promise<PdfOutlineEntry[]> {
+  if (!outline || outline.length === 0) {
+    return []
+  }
+
+  const entries: PdfOutlineEntry[] = []
+  const pageIndexCache = new Map<string, number>()
+
+  const walk = async (nodes: PdfOutlineNode[], level: number, prefix: string) => {
+    for (let index = 0; index < nodes.length; index += 1) {
+      const node = nodes[index]
+      const pageNumber = await resolvePdfDestinationPageNumber(
+        pdfDocument,
+        node.dest,
+        pageIndexCache,
+      )
+
+      if (pageNumber != null) {
+        entries.push({
+          key: `${prefix}-${index}-${pageNumber}`,
+          text: node.title?.trim() || `북마크 ${entries.length + 1}`,
+          level,
+          pageNumber,
+        })
+      }
+
+      if (node.items?.length) {
+        await walk(node.items as PdfOutlineNode[], level + 1, `${prefix}-${index}`)
+      }
+    }
+  }
+
+  await walk(outline as PdfOutlineNode[], 0, 'outline')
+  return entries
 }
 
 function hwpToPx(value?: number | null): number | undefined {
@@ -456,21 +1044,134 @@ function basePageHeight(pageLayout?: PageLayout | null): number {
   return hwpToPx(pageLayout?.height) ?? DEFAULT_PAGE_HEIGHT
 }
 
-function resolveZoomFactor(
+function resolveFitZoomFactor(
   pageLayout: PageLayout | null | undefined,
-  zoomPreset: ZoomPreset,
   workspaceWidth: number | null,
+  workspaceViewportHeight: number | null,
+  pageColumns: number,
 ): number {
-  if (zoomPreset !== 'fitWidth') {
-    return Number(zoomPreset) / 100
-  }
-
   if (!workspaceWidth) {
     return 1
   }
 
-  const availableWidth = Math.max(320, workspaceWidth - 48)
-  return Math.min(1.5, Math.max(0.58, availableWidth / basePageWidth(pageLayout)))
+  const totalGap = PAGE_STACK_GAP * Math.max(0, pageColumns - 1)
+  const availableWidth = Math.max(220, workspaceWidth - 48 - totalGap)
+  const pageWidth = availableWidth / Math.max(1, pageColumns)
+  const widthZoomFactor = Math.min(1.5, Math.max(0.18, pageWidth / basePageWidth(pageLayout)))
+
+  if (pageColumns <= 1 || !workspaceViewportHeight) {
+    return widthZoomFactor
+  }
+
+  const availableHeight = Math.max(220, workspaceViewportHeight - 12)
+  const heightZoomFactor = Math.min(1.5, Math.max(0.18, availableHeight / basePageHeight(pageLayout)))
+  return Math.min(widthZoomFactor, heightZoomFactor)
+}
+
+function resolveZoomFactor(
+  pageLayout: PageLayout | null | undefined,
+  zoomMode: ZoomMode,
+  zoomPercent: number,
+  workspaceWidth: number | null,
+  workspaceViewportHeight: number | null,
+  pageColumns: number,
+  fitViewportCorrection = 1,
+): number {
+  const fitZoomFactor = resolveFitZoomFactor(
+    pageLayout,
+    workspaceWidth,
+    workspaceViewportHeight,
+    pageColumns,
+  ) * fitViewportCorrection
+  if (zoomMode === 'fitWidth') {
+    return fitZoomFactor
+  }
+
+  return fitZoomFactor * (zoomPercent / 100)
+}
+
+function resolvePageColumns(viewMode: PageViewMode, workspaceWidth: number | null): number {
+  if (viewMode === 'single') {
+    return 1
+  }
+
+  if (viewMode === 'twoUp') {
+    return workspaceWidth != null && workspaceWidth < 760 ? 1 : 2
+  }
+
+  if (workspaceWidth != null && workspaceWidth < 760) {
+    return 1
+  }
+
+  if (workspaceWidth != null && workspaceWidth < 1220) {
+    return 2
+  }
+
+  return 4
+}
+
+function pageStackStyle(pageColumns: number): CSSProperties {
+  return {
+    gridTemplateColumns: `repeat(${pageColumns}, max-content)`,
+    justifyContent: 'center',
+    gap: `${PAGE_STACK_GAP}px`,
+  }
+}
+
+function resolvePdfFitZoomFactor(
+  page: PdfPageMetrics | undefined,
+  workspaceWidth: number | null,
+  workspaceViewportHeight: number | null,
+  pageColumns: number,
+): number {
+  if (!page || !workspaceWidth) {
+    return 1
+  }
+
+  const totalGap = PAGE_STACK_GAP * Math.max(0, pageColumns - 1)
+  const availableWidth = Math.max(220, workspaceWidth - 48 - totalGap)
+  const widthZoomFactor = Math.min(3, Math.max(0.18, availableWidth / Math.max(1, page.width * pageColumns)))
+
+  if (pageColumns <= 1 || !workspaceViewportHeight) {
+    return widthZoomFactor
+  }
+
+  const availableHeight = Math.max(220, workspaceViewportHeight - 12)
+  const heightZoomFactor = Math.min(3, Math.max(0.18, availableHeight / page.height))
+  return Math.min(widthZoomFactor, heightZoomFactor)
+}
+
+function resolvePdfZoomFactor(
+  page: PdfPageMetrics | undefined,
+  zoomMode: ZoomMode,
+  zoomPercent: number,
+  workspaceWidth: number | null,
+  workspaceViewportHeight: number | null,
+  pageColumns: number,
+  fitViewportCorrection = 1,
+): number {
+  const fitZoomFactor = resolvePdfFitZoomFactor(
+    page,
+    workspaceWidth,
+    workspaceViewportHeight,
+    pageColumns,
+  ) * fitViewportCorrection
+  return zoomMode === 'fitWidth' ? fitZoomFactor : fitZoomFactor * (zoomPercent / 100)
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value))
+}
+
+function measuredElementHeight(element?: Element | null): number {
+  if (!(element instanceof Element)) {
+    return 0
+  }
+
+  // WebKit frequently produces fractional line and row heights. Rounding those
+  // down across many blocks accumulates enough error to visibly clip the bottom
+  // of later pages, so pagination always uses a ceil'ed DOMRect height.
+  return Math.max(0, Math.ceil(element.getBoundingClientRect().height))
 }
 
 function pageStyle(pageLayout?: PageLayout | null, zoomFactor = 1): CSSProperties {
@@ -489,6 +1190,7 @@ function pageStyle(pageLayout?: PageLayout | null, zoomFactor = 1): CSSPropertie
     paddingBottom: `${paddingBottom}px`,
     paddingLeft: `${paddingLeft}px`,
     flexShrink: 0,
+    fontSize: `${10 * zoomFactor}pt`,
   }
 
   if (pageLayout?.pageBorder) {
@@ -511,6 +1213,16 @@ function pageInnerHeight(pageLayout?: PageLayout | null, zoomFactor = 1): number
   const paddingTop = (hwpToPx(pageLayout?.marginTop) ?? 76) * zoomFactor
   const paddingBottom = (hwpToPx(pageLayout?.marginBottom) ?? 57) * zoomFactor
   return Math.max(120, Math.round(height - paddingTop - paddingBottom))
+}
+
+function pdfPageStyle(page: PdfPageMetrics, zoomFactor = 1): CSSProperties {
+  return {
+    width: `${Math.round(page.width * zoomFactor)}px`,
+    height: `${Math.round(page.height * zoomFactor)}px`,
+    padding: '0',
+    flexShrink: 0,
+    overflow: 'hidden',
+  }
 }
 
 function pageContentWidth(pageLayout?: PageLayout | null, zoomFactor = 1): number {
@@ -583,6 +1295,9 @@ function textStyle(style?: TextStyle | null, zoomFactor = 1): CSSProperties {
     fontWeight: style?.bold ? 700 : undefined,
     fontStyle: style?.italic ? 'italic' : undefined,
     textDecoration: style?.underline ? 'underline' : undefined,
+    textDecorationColor:
+      style?.underline ? style.underlineColor ?? style.textColor ?? undefined : undefined,
+    textDecorationSkipInk: style?.underline ? 'none' : undefined,
   }
 }
 
@@ -664,6 +1379,14 @@ function mapBorderStyle(style?: string | null): CSSProperties['borderLeftStyle']
     case 'SLIM_THICK':
     case 'THICK_SLIM':
       return 'double'
+    case 'INSET':
+      return 'inset'
+    case 'OUTSET':
+      return 'outset'
+    case 'GROOVE':
+      return 'groove'
+    case 'RIDGE':
+      return 'ridge'
     case 'DOT':
       return 'dotted'
     case 'DASH':
@@ -683,12 +1406,13 @@ function normalizeBorderWidth(width?: string | null): string | undefined {
 
   const stripped = width.replace(/\s+/g, '')
 
-  // Convert mm values to integer px so sub-pixel borders (e.g. 0.12mm ≈ 0.5px)
-  // are always rendered as at least 1 visible pixel.
+  // Preserve sub-pixel hairlines. HWP/HWPX uses many 0.1~0.12mm borders for
+  // layout guides, and rounding those to 1px makes invisible scaffold tables
+  // look like thick black boxes.
   const mmMatch = stripped.match(/^([\d.]+)mm$/)
   if (mmMatch) {
     const px = parseFloat(mmMatch[1]) * (96 / 25.4)
-    return `${Math.max(1, Math.round(px))}px`
+    return `${Math.max(0.25, Math.round(px * 100) / 100)}px`
   }
 
   return stripped
@@ -722,20 +1446,60 @@ function fontFamilyToCss(fontFamily?: string | null): string | undefined {
     families.add('Malgun Gothic')
   }
   if (/휴먼명조/i.test(trimmed)) {
+    families.add('한양사랑명조체')
+    families.add('HYCUMyungJo')
+    families.add('HYCUMyungJo M')
+    families.add('HYCUMyungJoM_OTF')
+    families.add('PC명조')
+    families.add('AppleMyungjo')
+    families.add('나눔명조')
+    families.add('NanumMyeongjo')
+  }
+  if (/한양중고딕|한양고딕|HY중고딕|HY고딕/i.test(trimmed)) {
+    families.add('한양사랑고딕체')
+    families.add('HYCUGothic')
+    families.add('HYCUGothic M')
+    families.add('HYCUGothicM_OTF')
+    families.add('나눔고딕')
+    families.add('NanumGothic')
+  }
+  if (/헤드라인/i.test(trimmed)) {
+    families.add('헤드라인A')
+    families.add('HYCUGothic B')
+    families.add('HYCUGothic')
+    families.add('한양사랑고딕체')
+  }
+  if (/울릉도/i.test(trimmed)) {
+    families.add('한양사랑명조체')
+    families.add('HYCUMyungJo')
+  }
+  if (/나눔고딕/i.test(trimmed)) {
+    families.add('NanumGothic')
+  }
+  if (/나눔명조/i.test(trimmed)) {
+    families.add('NanumMyeongjo')
+  }
+  if (/휴먼명조/i.test(trimmed)) {
     families.add('AppleMyungjo')
   }
   if (/한컴바탕|함초롬바탕|바탕체|바탕/i.test(trimmed)) {
     families.add('Batang')
+    families.add('한양사랑명조체')
+    families.add('HYCUMyungJo')
     families.add('AppleMyungjo')
     families.add('Nanum Myeongjo')
   }
   if (/한컴고딕|함초롬돋움|견고딕|중고딕|고딕|돋움|굴림|헤드라인/i.test(trimmed)) {
+    families.add('한양사랑고딕체')
+    families.add('HYCUGothic')
     families.add('Dotum')
     families.add('Gulim')
     families.add('Apple SD Gothic Neo')
     families.add('NanumSquare')
   }
   if (/한양신명조|신명조|명조/i.test(trimmed)) {
+    families.add('한양사랑명조체')
+    families.add('HYCUMyungJo')
     families.add('AppleMyungjo')
     families.add('Nanum Myeongjo')
   }
@@ -808,6 +1572,12 @@ function applyTableCellStyle(output: CSSProperties, style?: TableCellStyle | nul
   if (style.backgroundColor) {
     output.backgroundColor = style.backgroundColor
   }
+  if (style.backgroundImage) {
+    output.backgroundImage = style.backgroundImage
+    output.backgroundRepeat = 'no-repeat'
+    output.backgroundSize = '100% 100%'
+    output.backgroundPosition = 'center'
+  }
 
   applyBorderSide(output, 'Left', style.borderLeft)
   applyBorderSide(output, 'Right', style.borderRight)
@@ -857,7 +1627,57 @@ function shouldFitTableToContainer(table: TableValue): boolean {
   return !table.noAdjust && table.rows.length === 1 && (table.rows[0]?.cells.length ?? 0) === 1
 }
 
-function tableStyle(table: TableValue, zoomFactor: number): CSSProperties {
+function tableContainsImageBlock(table: TableValue): boolean {
+  return table.rows.some((row) =>
+    row.cells.some((cell) => cell.blocks.some((block) => block.type === 'image')),
+  )
+}
+
+function tableMaxRunFontSize(table: TableValue): number {
+  let maxFontSize = 0
+  for (const row of table.rows) {
+    for (const cell of row.cells) {
+      for (const block of cell.blocks) {
+        if (block.type !== 'paragraph') {
+          continue
+        }
+        for (const run of block.value.runs) {
+          maxFontSize = Math.max(maxFontSize, run.style?.fontSize ?? 0)
+        }
+      }
+    }
+  }
+  return maxFontSize
+}
+
+function hwpFirstPageCoverTableSuppressionMode(
+  table: TableValue,
+  context: PlaceholderContext,
+): 'none' | 'table' | 'all' {
+  if ((context.format ?? '').toLowerCase() !== 'hwp' || context.pageNumber !== 1) {
+    return 'none'
+  }
+
+  if ((table.width ?? 0) < 30_000) {
+    return 'none'
+  }
+
+  if (tableContainsImageBlock(table)) {
+    return 'all'
+  }
+
+  if (tableMaxRunFontSize(table) >= 2200) {
+    return 'table'
+  }
+
+  return 'none'
+}
+
+function tableStyle(
+  table: TableValue,
+  zoomFactor: number,
+  options?: { suppressChrome?: boolean },
+): CSSProperties {
   const resolvedWidth = table.width
     ? `${Math.round((hwpToPx(table.width) ?? 0) * zoomFactor)}px`
     : undefined
@@ -870,6 +1690,8 @@ function tableStyle(table: TableValue, zoomFactor: number): CSSProperties {
     maxWidth: '100%',
     boxSizing: 'border-box',
     tableLayout: table.width ? 'fixed' : 'auto',
+    border: 'none',
+    background: 'transparent',
   }
 
   if (shouldUseSeparateBorderModel(table)) {
@@ -877,14 +1699,16 @@ function tableStyle(table: TableValue, zoomFactor: number): CSSProperties {
     style.borderSpacing = 0
   }
 
-  applyTableCellStyle(style, table.style)
+  if (!options?.suppressChrome) {
+    applyTableCellStyle(style, table.style)
+  }
   return style
 }
 
 function tableCellStyle(
   cell: TableCell,
   zoomFactor: number,
-  options?: { ignoreWidth?: boolean },
+  options?: { ignoreWidth?: boolean; suppressChrome?: boolean },
 ): CSSProperties {
   const style: CSSProperties = {
     width:
@@ -905,9 +1729,13 @@ function tableCellStyle(
     paddingBottom: cell.paddingBottom
       ? `${Math.round((hwpToPx(cell.paddingBottom) ?? 0) * zoomFactor)}px`
       : undefined,
+    border: 'none',
+    background: 'transparent',
   }
 
-  applyTableCellStyle(style, cell.style)
+  if (!options?.suppressChrome) {
+    applyTableCellStyle(style, cell.style)
+  }
   return style
 }
 
@@ -1127,6 +1955,7 @@ function floatingObjectReserveStyle(image: ImageValue, zoomFactor: number): CSSP
     }
     style.shapeOutside = 'margin-box'
   } else if (wrapMode === 'TOP_AND_BOTTOM') {
+    style.width = `${floatingObjectFootprintWidth(image, zoomFactor)}px`
     style.clear = 'both'
     style.marginTop = `${imageDistancePx(image, 'top', zoomFactor)}px`
     style.marginBottom = `${imageDistancePx(image, 'bottom', zoomFactor)}px`
@@ -1291,7 +2120,14 @@ function blockHeightHint(block: DocumentBlock, zoomFactor: number): number | nul
 }
 
 function blockPageBreakBefore(block: DocumentBlock): boolean {
-  return block.type === 'paragraph' ? block.value.pageBreakBefore : false
+  switch (block.type) {
+    case 'paragraph':
+    case 'table':
+    case 'image':
+    case 'footnote':
+    case 'unsupported':
+      return block.value.pageBreakBefore
+  }
 }
 
 function blockKeepWithNext(block: DocumentBlock): boolean {
@@ -1303,13 +2139,11 @@ function blockKeepLines(block: DocumentBlock): boolean {
 }
 
 function paginationHeight(actualHeight: number, hintHeight: number | null): number {
-  if (hintHeight == null || hintHeight <= 0) {
-    return actualHeight
+  if (hintHeight != null && hintHeight > 0) {
+    return hintHeight
   }
 
-  // Trust hint height more heavily — it comes from the document's own layout metrics
-  // Blend: 70% hint, 30% actual to absorb font/rendering differences
-  return Math.round(hintHeight * 0.7 + actualHeight * 0.3)
+  return actualHeight
 }
 
 function overflowsRemaining(
@@ -1317,16 +2151,15 @@ function overflowsRemaining(
   hintHeight: number | null,
   remainingHeight: number,
 ): boolean {
-  // If hint says it fits, trust it — the document's own layout metrics are authoritative
-  if (hintHeight != null && hintHeight > 0 && hintHeight <= remainingHeight + PAGINATION_TOLERANCE) {
-    return false
+  if (hintHeight != null && hintHeight > 0) {
+    return hintHeight > remainingHeight + PAGINATION_TOLERANCE
   }
 
   if (actualHeight <= remainingHeight + PAGINATION_TOLERANCE) {
     return false
   }
 
-  return paginationHeight(actualHeight, hintHeight) > remainingHeight + PAGINATION_TOLERANCE
+  return true
 }
 
 function fitsFreshPage(item: PaginationItem, availableHeight: number): boolean {
@@ -1761,16 +2594,19 @@ function buildSingleCellSplitMeasurement(
     const childBlock = sourceBlocks[index]
     return {
       block: childBlock,
-      actualHeight: Math.max(1, Math.round(childNode.offsetHeight)),
+      actualHeight: Math.max(1, measuredElementHeight(childNode)),
       hintHeight: blockHeightHint(childBlock, zoomFactor),
     }
   })
 
   const childHintSum = childItems.reduce((sum, item) => sum + (item.hintHeight ?? item.actualHeight), 0)
-  const chromeHeight = Math.max(0, Math.round(blockNode.offsetHeight - cellContent.offsetHeight))
+  const chromeHeight = Math.max(
+    0,
+    measuredElementHeight(blockNode) - measuredElementHeight(cellContent),
+  )
   const chromeHintHeight = Math.max(
     0,
-    Math.round((tableHintHeight ?? blockNode.offsetHeight) - childHintSum),
+    Math.round((tableHintHeight ?? measuredElementHeight(blockNode)) - childHintSum),
   )
 
   return {
@@ -1801,7 +2637,7 @@ function buildTableRowSplitMeasurement(
 
   const rowItems = block.value.rows.map((row, index) => ({
     row,
-    actualHeight: Math.max(1, Math.round(rowNodes[index]?.offsetHeight ?? 0)),
+    actualHeight: Math.max(1, measuredElementHeight(rowNodes[index])),
     hintHeight: tableRowHeightHint(row, zoomFactor),
   }))
 
@@ -1812,13 +2648,11 @@ function buildTableRowSplitMeasurement(
   const tableHintHeight = blockHeightHint(block, zoomFactor)
   const chromeHeight = Math.max(
     0,
-    Math.round(
-      blockNode.offsetHeight - rowItems.reduce((sum, rowItem) => sum + rowItem.actualHeight, 0),
-    ),
+    measuredElementHeight(blockNode) - rowItems.reduce((sum, rowItem) => sum + rowItem.actualHeight, 0),
   )
   const chromeHintHeight = Math.max(
     0,
-    Math.round((tableHintHeight ?? blockNode.offsetHeight) - totalRowHintHeight),
+    Math.round((tableHintHeight ?? measuredElementHeight(blockNode)) - totalRowHintHeight),
   )
   const safeBreakStarts = computeSafeRowBreakStarts(block.value)
   const headerRowCount = resolveHeaderRowCount(block.value, safeBreakStarts)
@@ -1855,9 +2689,9 @@ function buildParagraphSplitMeasurement(
     : 0
   const contentActualHeight = Math.max(
     1,
-    Math.round(blockNode.offsetHeight - topMarginHeight - bottomMarginHeight),
+    measuredElementHeight(blockNode) - topMarginHeight - bottomMarginHeight,
   )
-  const hintHeight = blockHeightHint(block, zoomFactor) ?? blockNode.offsetHeight
+  const hintHeight = blockHeightHint(block, zoomFactor) ?? measuredElementHeight(blockNode)
   const contentHintHeight = Math.max(
     1,
     Math.round(hintHeight - topMarginHeight - bottomMarginHeight),
@@ -1867,7 +2701,7 @@ function buildParagraphSplitMeasurement(
   )
   const lineActualHeights =
     lineNodes.length === lineRuns.length
-      ? lineNodes.map((lineNode) => Math.max(1, Math.round(lineNode.offsetHeight)))
+      ? lineNodes.map((lineNode) => Math.max(1, measuredElementHeight(lineNode)))
       : Array.from({ length: lineRuns.length }, () =>
           Math.max(1, Math.round(contentActualHeight / lineRuns.length)),
         )
@@ -1962,7 +2796,7 @@ function measurePaginationItems(
     return {
       key: `${section.id}-${index}`,
       block,
-      actualHeight: Math.max(1, Math.round(blockNode.offsetHeight)),
+      actualHeight: Math.max(1, measuredElementHeight(blockNode)),
       hintHeight: directHintHeight ?? measuredHintHeight,
       pageBreakBefore: blockPageBreakBefore(block),
       keepWithNext: blockKeepWithNext(block),
@@ -2624,19 +3458,27 @@ function renderTableCell(
   zoomFactor: number,
   context: PlaceholderContext,
   assets: AssetRef[],
-  options?: { ignoreWidth?: boolean },
+  options?: { ignoreWidth?: boolean; suppressChrome?: boolean },
 ) {
   const CellTag = cell.isHeader ? 'th' : 'td'
+  const imageOnlyCell = cell.blocks.length > 0 && cell.blocks.every((block) => block.type === 'image')
+  const cellStyleValue = tableCellStyle(cell, zoomFactor, options)
+  if ((context.format ?? '').toLowerCase() === 'hwp' && context.pageNumber === 1 && imageOnlyCell) {
+    cellStyleValue.verticalAlign = 'middle'
+  }
   return (
     <CellTag
       key={keyPrefix}
       className={cell.isHeader ? 'table-cell table-cell-header' : 'table-cell'}
       colSpan={cell.colSpan ?? 1}
       rowSpan={cell.rowSpan ?? 1}
-      style={tableCellStyle(cell, zoomFactor, options)}
+      style={cellStyleValue}
     >
       {cell.style?.diagonal ? renderTableCellDiagonal(cell.style.diagonal, keyPrefix) : null}
-      <div className="table-cell-content" data-table-cell-content="true">
+      <div
+        className={imageOnlyCell ? 'table-cell-content table-cell-content-images' : 'table-cell-content'}
+        data-table-cell-content="true"
+      >
         {cell.blocks.length > 0
           ? cell.blocks.map((block, index) =>
               (
@@ -2714,9 +3556,15 @@ function renderBlock(
     }
     case 'table': {
       const fitToContainer = shouldFitTableToContainer(block.value)
+      const coverSuppressionMode = hwpFirstPageCoverTableSuppressionMode(block.value, context)
+      const suppressTableChrome = coverSuppressionMode !== 'none'
+      const suppressCellChrome = coverSuppressionMode === 'all'
       return (
-        <div key={keyPrefix} className="table-block">
-          <table style={tableStyle(block.value, zoomFactor)}>
+        <div
+          key={keyPrefix}
+          className={suppressTableChrome ? 'table-block table-block-cover' : 'table-block'}
+        >
+          <table style={tableStyle(block.value, zoomFactor, { suppressChrome: suppressTableChrome })}>
             <tbody>
               {block.value.rows.map((row, rowIndex) => (
                 <tr
@@ -2730,7 +3578,10 @@ function renderBlock(
                       zoomFactor,
                       context,
                       assets,
-                      fitToContainer ? { ignoreWidth: true } : undefined,
+                      {
+                        ignoreWidth: fitToContainer,
+                        suppressChrome: suppressCellChrome,
+                      },
                     )
                   ))}
                 </tr>
@@ -2743,9 +3594,16 @@ function renderBlock(
     case 'image': {
       const asset = resolveAsset(assets, block.value.assetId)
       const canRenderImage = asset?.mediaType.startsWith('image/') && Boolean(asset.dataUri)
+      const imageClassName = [
+        'image-block',
+        block.value.treatAsChar ? 'image-inline' : 'image-floating',
+        canRenderImage ? 'image-rendered' : null,
+      ]
+        .filter(Boolean)
+        .join(' ')
       const imageContent = (
         <div
-          className={block.value.treatAsChar ? 'image-block image-inline' : 'image-block image-floating'}
+          className={imageClassName}
           style={objectPlacementStyle(block.value, zoomFactor)}
         >
           {canRenderImage ? (
@@ -2844,24 +3702,688 @@ function LazyPage({
   return <article ref={ref} style={style} {...rest}>{children}</article>
 }
 
+function PdfPageView({
+  pdfDocument,
+  pageNumber,
+  zoomFactor,
+  searchMatches,
+  activeSearchMatchIndex,
+}: {
+  pdfDocument: PDFDocumentProxy
+  pageNumber: number
+  zoomFactor: number
+  searchMatches: SearchMatch[]
+  activeSearchMatchIndex: number
+}) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const textLayerRef = useRef<HTMLDivElement | null>(null)
+  const renderedTextLayerRef = useRef<TextLayer | null>(null)
+  const [searchBoxes, setSearchBoxes] = useState<PdfSearchHighlightBox[]>([])
+  const [textLayerRevision, setTextLayerRevision] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+    let renderTask: RenderTask | null = null
+    let textLayer: TextLayer | null = null
+    let page: PDFPageProxy | null = null
+
+    const renderPage = async () => {
+      page = await pdfDocument.getPage(pageNumber)
+      if (cancelled || !canvasRef.current || !textLayerRef.current) {
+        return
+      }
+
+      const canvas = canvasRef.current
+      const textLayerContainer = textLayerRef.current
+      const viewport = page.getViewport({ scale: zoomFactor })
+      const outputScale = window.devicePixelRatio || 1
+      const context = canvas.getContext('2d')
+      if (!context) {
+        return
+      }
+
+      canvas.width = Math.max(1, Math.floor(viewport.width * outputScale))
+      canvas.height = Math.max(1, Math.floor(viewport.height * outputScale))
+      canvas.style.width = `${Math.floor(viewport.width)}px`
+      canvas.style.height = `${Math.floor(viewport.height)}px`
+
+      renderTask = page.render({
+        canvas,
+        canvasContext: context,
+        viewport,
+        transform: outputScale === 1 ? undefined : [outputScale, 0, 0, outputScale, 0, 0],
+      })
+
+      try {
+        await renderTask.promise
+      } catch (error) {
+        if (!cancelled && !(error instanceof Error && error.name === 'RenderingCancelledException')) {
+          throw error
+        }
+      }
+
+      if (cancelled) {
+        return
+      }
+
+      textLayerContainer.replaceChildren()
+      textLayerContainer.style.setProperty('--total-scale-factor', `${zoomFactor}`)
+      textLayer = new TextLayer({
+        textContentSource: await page.getTextContent(),
+        container: textLayerContainer,
+        viewport,
+      })
+      renderedTextLayerRef.current = textLayer
+      await textLayer.render()
+      if (!cancelled) {
+        setTextLayerRevision((value) => value + 1)
+      }
+      page.cleanup()
+    }
+
+    void renderPage()
+
+    return () => {
+      cancelled = true
+      renderTask?.cancel()
+      textLayer?.cancel()
+      page?.cleanup()
+      renderedTextLayerRef.current = null
+      setSearchBoxes([])
+    }
+  }, [pageNumber, pdfDocument, zoomFactor])
+
+  useLayoutEffect(() => {
+    const textLayer = renderedTextLayerRef.current
+    const textLayerContainer = textLayerRef.current
+    if (!textLayer || !textLayerContainer || searchMatches.length === 0) {
+      setSearchBoxes([])
+      return
+    }
+
+    let cancelled = false
+    const rafId = requestAnimationFrame(() => {
+      if (cancelled) {
+        return
+      }
+
+      const containerRect = textLayerContainer.getBoundingClientRect()
+      const nextBoxes: PdfSearchHighlightBox[] = []
+
+      for (const match of searchMatches) {
+        let anchored = false
+        for (const itemIndex of match.itemIndexes ?? []) {
+          const textDiv = textLayer.textDivs[itemIndex]
+          if (!(textDiv instanceof HTMLElement)) {
+            continue
+          }
+
+          const rect = textDiv.getBoundingClientRect()
+          if (rect.width <= 0 || rect.height <= 0) {
+            continue
+          }
+
+          nextBoxes.push({
+            key: `${match.matchGlobalIndex}-${itemIndex}`,
+            left: rect.left - containerRect.left,
+            top: rect.top - containerRect.top,
+            width: rect.width,
+            height: rect.height,
+            matchGlobalIndex: match.matchGlobalIndex,
+            isActive: match.matchGlobalIndex === activeSearchMatchIndex,
+            isAnchor: !anchored,
+          })
+          anchored = true
+        }
+      }
+
+      setSearchBoxes(nextBoxes)
+    })
+
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(rafId)
+    }
+  }, [activeSearchMatchIndex, searchMatches, textLayerRevision])
+
+  return (
+    <div className="pdf-page-surface" style={{ ['--total-scale-factor' as string]: `${zoomFactor}` }}>
+      <canvas ref={canvasRef} className="pdf-page-canvas" />
+      <div ref={textLayerRef} className="pdf-text-layer textLayer" />
+      {searchBoxes.length > 0 ? (
+        <div className="pdf-search-layer" aria-hidden="true">
+          {searchBoxes.map((box) => (
+            <div
+              key={box.key}
+              className={`pdf-search-hit${box.isActive ? ' active' : ''}`}
+              data-search-match={box.isAnchor ? box.matchGlobalIndex : undefined}
+              style={{
+                left: `${box.left}px`,
+                top: `${box.top}px`,
+                width: `${box.width}px`,
+                height: `${box.height}px`,
+              }}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function App() {
   const [opening, setOpening] = useState(false)
+  const [printing, setPrinting] = useState(false)
   const [openError, setOpenError] = useState<string | null>(null)
   const [loadedDocument, setLoadedDocument] = useState<LoadedDocument | null>(null)
+  const [documentMode, setDocumentMode] = useState<'view' | 'edit'>('view')
+  const [markdownSource, setMarkdownSource] = useState('')
+  const [savedMarkdownSource, setSavedMarkdownSource] = useState('')
+  const [savingMarkdown, setSavingMarkdown] = useState(false)
+  const [pdfDocumentProxy, setPdfDocumentProxy] = useState<PDFDocumentProxy | null>(null)
+  const [pdfPageMetrics, setPdfPageMetrics] = useState<PdfPageMetrics[]>([])
+  const [pdfOutlineEntries, setPdfOutlineEntries] = useState<PdfOutlineEntry[]>([])
+  const [pdfLoadError, setPdfLoadError] = useState<string | null>(null)
+  const [pdfSearchIndexing, setPdfSearchIndexing] = useState(false)
+  const [pdfSearchMatchesState, setPdfSearchMatchesState] = useState<SearchMatch[]>([])
+  const [pdfSearchResultPreviewsState, setPdfSearchResultPreviewsState] = useState<SearchResultPreview[]>([])
+  const [pdfNativeSearchTextPages, setPdfNativeSearchTextPages] = useState<string[] | null>(null)
+  const [pdfNativeSearchTextError, setPdfNativeSearchTextError] = useState<string | null>(null)
   const [renderedPages, setRenderedPages] = useState<RenderedPage[]>([])
-  const [zoomPreset, setZoomPreset] = useState<ZoomPreset>('fitWidth')
+  const [zoomMode, setZoomMode] = useState<ZoomMode>('fitWidth')
+  const [zoomPercent, setZoomPercent] = useState(100)
+  const [pageViewMode, setPageViewMode] = useState<PageViewMode>('single')
   const [workspaceWidth, setWorkspaceWidth] = useState<number | null>(null)
+  const [workspaceViewportHeight, setWorkspaceViewportHeight] = useState<number | null>(null)
+  const [fitViewportCorrection, setFitViewportCorrection] = useState(1)
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchMatchIndex, setSearchMatchIndex] = useState(0)
+  const [searchNavigationRequest, setSearchNavigationRequest] = useState<SearchNavigationRequest | null>(null)
+  const [activePageNumber, setActivePageNumber] = useState(1)
+  const [scrollStatus, setScrollStatus] = useState<ScrollStatus>({
+    horizontalOverflow: false,
+    horizontalProgress: 0,
+    verticalOverflow: false,
+    verticalProgress: 0,
+  })
   const searchInputRef = useRef<HTMLInputElement | null>(null)
   const [recentFiles, setRecentFiles] = useState<RecentFile[]>(loadRecentFiles)
   const [dragOver, setDragOver] = useState(false)
   const [darkMode, setDarkMode] = useState(false)
   const deferredDocument = useDeferredValue(loadedDocument)
   const pageWorkspaceRef = useRef<HTMLDivElement | null>(null)
+  const pageStackRef = useRef<HTMLDivElement | null>(null)
   const measureRefs = useRef<Record<number, HTMLDivElement | null>>({})
+  const pendingViewportAnchorRef = useRef<ViewportPageAnchor | null>(null)
+  const markdownIdentityRef = useRef<string | null>(null)
+  const markdownParseRequestRef = useRef(0)
   const tauriAvailable = '__TAURI_INTERNALS__' in window
+  const pageColumns = useMemo(
+    () => resolvePageColumns(pageViewMode, workspaceWidth),
+    [pageViewMode, workspaceWidth],
+  )
+  const pdfSearchIndexRequested = searchOpen && searchQuery.trim().length >= 2
+  const nativePdfSearchTextSupported =
+    isPdfDocument(loadedDocument) && Boolean(loadedDocument?.filePath || loadedDocument?.binaryDataUri)
+
+  useEffect(() => {
+    if (!import.meta.env.DEV || loadedDocument) {
+      return
+    }
+
+    const fixtureUrl = new URLSearchParams(window.location.search).get('fixture')
+    if (!fixtureUrl) {
+      return
+    }
+
+    let cancelled = false
+
+    const loadFixture = async () => {
+      setOpening(true)
+      setOpenError(null)
+
+      try {
+        const response = await fetch(fixtureUrl)
+        if (!response.ok) {
+          throw new Error(`fixture load failed: ${response.status} ${response.statusText}`)
+        }
+        const payload = (await response.json()) as DevFixturePayload
+        if (cancelled) {
+          return
+        }
+        startTransition(() => {
+          setLoadedDocument(normalizeFixtureDocument(payload, fixtureUrl))
+        })
+      } catch (error) {
+        if (!cancelled) {
+          setOpenError(error instanceof Error ? error.message : String(error))
+        }
+      } finally {
+        if (!cancelled) {
+          setOpening(false)
+        }
+      }
+    }
+
+    void loadFixture()
+
+    return () => {
+      cancelled = true
+    }
+  }, [loadedDocument])
+
+  useEffect(() => {
+    if (!loadedDocument || !isMarkdownDocument(loadedDocument)) {
+      markdownIdentityRef.current = null
+      setDocumentMode('view')
+      setMarkdownSource('')
+      setSavedMarkdownSource('')
+      setSavingMarkdown(false)
+      return
+    }
+
+    const identity = markdownDocumentIdentity(loadedDocument)
+    if (markdownIdentityRef.current === identity) {
+      return
+    }
+
+    markdownIdentityRef.current = identity
+    setDocumentMode('view')
+    setMarkdownSource(loadedDocument.sourceText ?? '')
+    setSavedMarkdownSource(loadedDocument.sourceText ?? '')
+    setSavingMarkdown(false)
+  }, [loadedDocument])
+
+  useEffect(() => {
+    if (!loadedDocument || !isPdfDocument(loadedDocument) || !loadedDocument.binaryDataUri) {
+      setPdfDocumentProxy(null)
+      setPdfPageMetrics([])
+      setPdfOutlineEntries([])
+      setPdfLoadError(null)
+      setPdfNativeSearchTextPages(null)
+      setPdfNativeSearchTextError(null)
+      setPdfSearchIndexing(false)
+      setPdfSearchMatchesState([])
+      setPdfSearchResultPreviewsState([])
+      return
+    }
+
+    let cancelled = false
+    let loadedPdf: PDFDocumentProxy | null = null
+    setPdfLoadError(null)
+    setPdfNativeSearchTextPages(null)
+    setPdfNativeSearchTextError(null)
+
+    const loadPdf = async () => {
+      const task = getDocument({ data: decodeDataUriToBytes(loadedDocument.binaryDataUri!) })
+      try {
+        const pdf = await task.promise
+        if (cancelled) {
+          void pdf.destroy()
+          return
+        }
+
+        loadedPdf = pdf
+        const metrics: PdfPageMetrics[] = []
+        for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+          const page = await pdf.getPage(pageNumber)
+          const viewport = page.getViewport({ scale: 1 })
+          metrics.push({
+            pageNumber,
+            width: viewport.width,
+            height: viewport.height,
+          })
+        }
+
+        if (!cancelled) {
+          setPdfDocumentProxy(pdf)
+          setPdfPageMetrics(metrics)
+          setPdfOutlineEntries([])
+          setPdfSearchIndexing(false)
+          setPdfSearchMatchesState([])
+          setPdfSearchResultPreviewsState([])
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setPdfDocumentProxy(null)
+          setPdfPageMetrics([])
+          setPdfOutlineEntries([])
+          setPdfLoadError(error instanceof Error ? error.message : String(error))
+          setPdfSearchIndexing(false)
+          setPdfSearchMatchesState([])
+          setPdfSearchResultPreviewsState([])
+        }
+      }
+    }
+
+    void loadPdf()
+
+    return () => {
+      cancelled = true
+      if (loadedPdf) {
+        void loadedPdf.destroy()
+      }
+    }
+  }, [loadedDocument])
+
+  useEffect(() => {
+    if (
+      !nativePdfSearchTextSupported ||
+      !pdfSearchIndexRequested ||
+      pdfNativeSearchTextPages ||
+      pdfNativeSearchTextError
+    ) {
+      return
+    }
+
+    const currentDocument = loadedDocument
+    if (
+      !currentDocument ||
+      !isPdfDocument(currentDocument) ||
+      (!currentDocument.filePath && !currentDocument.binaryDataUri)
+    ) {
+      return
+    }
+
+    let cancelled = false
+
+    const loadNativePdfSearchText = async () => {
+      try {
+        const pages = currentDocument.filePath
+          ? await extractPdfSearchText(currentDocument.filePath)
+          : await extractPdfSearchTextBytes(
+              decodeDataUriToBytes(currentDocument.binaryDataUri!),
+            )
+        if (!cancelled) {
+          setPdfNativeSearchTextPages(pages)
+        }
+      } catch (error) {
+        if (!cancelled && currentDocument.binaryDataUri) {
+          try {
+            const pages = await extractPdfSearchTextBytes(
+              decodeDataUriToBytes(currentDocument.binaryDataUri),
+            )
+            if (!cancelled) {
+              setPdfNativeSearchTextPages(pages)
+              setPdfNativeSearchTextError(null)
+            }
+            return
+          } catch (fallbackError) {
+            if (!cancelled) {
+              setPdfNativeSearchTextError(
+                fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+              )
+            }
+            return
+          }
+        }
+
+        if (!cancelled) {
+          setPdfNativeSearchTextError(error instanceof Error ? error.message : String(error))
+        }
+      }
+    }
+
+    void loadNativePdfSearchText()
+
+    return () => {
+      cancelled = true
+    }
+  }, [
+    loadedDocument?.binaryDataUri,
+    loadedDocument?.filePath,
+    nativePdfSearchTextSupported,
+    pdfNativeSearchTextError,
+    pdfNativeSearchTextPages,
+    pdfSearchIndexRequested,
+  ])
+
+  useEffect(() => {
+    if (!pdfDocumentProxy) {
+      setPdfOutlineEntries([])
+      setPdfSearchIndexing(false)
+      setPdfSearchMatchesState([])
+      setPdfSearchResultPreviewsState([])
+      return
+    }
+
+    let cancelled = false
+
+    const loadPdfOutline = async () => {
+      try {
+        const outline = await pdfDocumentProxy.getOutline()
+        if (!cancelled) {
+          setPdfOutlineEntries(await flattenPdfOutlineEntries(pdfDocumentProxy, outline))
+        }
+      } catch {
+        if (!cancelled) {
+          setPdfOutlineEntries([])
+        }
+      }
+    }
+
+    void loadPdfOutline()
+
+    return () => {
+      cancelled = true
+    }
+  }, [pdfDocumentProxy])
+
+  useEffect(() => {
+    if (!pdfDocumentProxy) {
+      setPdfSearchIndexing(false)
+      setPdfSearchMatchesState([])
+      setPdfSearchResultPreviewsState([])
+      return
+    }
+
+    if (!pdfSearchIndexRequested) {
+      setPdfSearchIndexing(false)
+      setPdfSearchMatchesState([])
+      setPdfSearchResultPreviewsState([])
+      return
+    }
+
+    let cancelled = false
+    setPdfSearchIndexing(true)
+    setPdfSearchMatchesState([])
+    setPdfSearchResultPreviewsState([])
+
+    const loadPdfSearchIndex = async () => {
+      const nextMatches: SearchMatch[] = []
+      const nextPreviews: SearchResultPreview[] = []
+      const query = compactPdfSearchText(searchQuery)
+
+      if (query.length < 2) {
+        setPdfSearchIndexing(false)
+        return
+      }
+
+      if (
+        nativePdfSearchTextSupported &&
+        !pdfNativeSearchTextPages &&
+        !pdfNativeSearchTextError
+      ) {
+        return
+      }
+
+      try {
+        if (nativePdfSearchTextSupported && pdfNativeSearchTextPages) {
+          for (const [pageIndex, pageText] of pdfNativeSearchTextPages.entries()) {
+            if (cancelled) {
+              return
+            }
+
+            const pageNumber = pageIndex + 1
+            const searchIndex = buildPlainTextSearchIndex(pageText)
+            let pos = 0
+
+            while (pos < searchIndex.compactSearchableText.length) {
+              const idx = searchIndex.compactSearchableText.indexOf(query, pos)
+              if (idx === -1) {
+                break
+              }
+
+              const previewRange = resolvePdfSearchableRange(
+                searchIndex.compactToSearchableIndex,
+                idx,
+                query.length,
+              )
+              const matchGlobalIndex = nextMatches.length
+              nextMatches.push({
+                pageIndex,
+                pageNumber,
+                start: previewRange.start,
+                length: previewRange.length,
+                matchGlobalIndex,
+              })
+
+              const { before, matchText, after } = buildSearchSnippet(
+                searchIndex.searchableText,
+                previewRange.start,
+                previewRange.length,
+              )
+              nextPreviews.push({
+                matchGlobalIndex,
+                pageNumber,
+                before,
+                matchText,
+                after,
+              })
+
+              pos = idx + 1
+            }
+
+            if (
+              !cancelled &&
+              (pageNumber === pdfNativeSearchTextPages.length || pageNumber % 24 === 0)
+            ) {
+              startTransition(() => {
+                setPdfSearchMatchesState([...nextMatches])
+                setPdfSearchResultPreviewsState([...nextPreviews])
+              })
+            }
+
+            await new Promise<void>((resolve) => {
+              window.setTimeout(resolve, 0)
+            })
+          }
+
+          return
+        }
+
+        for (let pageNumber = 1; pageNumber <= pdfDocumentProxy.numPages; pageNumber += 1) {
+          if (cancelled) {
+            return
+          }
+
+          const page = await pdfDocumentProxy.getPage(pageNumber)
+          const textContent = await page.getTextContent()
+          const pageIndex = buildPdfPageTextIndex(pageNumber, textContent)
+
+          let pos = 0
+          while (pos < pageIndex.compactSearchableText.length) {
+            const idx = pageIndex.compactSearchableText.indexOf(query, pos)
+            if (idx === -1) {
+              break
+            }
+
+            const matchGlobalIndex = nextMatches.length
+            nextMatches.push({
+              pageIndex: pageNumber - 1,
+              pageNumber,
+              start: idx,
+              length: query.length,
+              itemIndexes: findPdfMatchItemIndexes(pageIndex.itemRanges, idx, idx + query.length),
+              matchGlobalIndex,
+            })
+
+            const previewRange = resolvePdfSearchableRange(
+              pageIndex.compactToSearchableIndex,
+              idx,
+              query.length,
+            )
+            const { before, matchText, after } = buildSearchSnippet(
+              pageIndex.searchableText,
+              previewRange.start,
+              previewRange.length,
+            )
+            nextPreviews.push({
+              matchGlobalIndex,
+              pageNumber,
+              before,
+              matchText,
+              after,
+            })
+
+            pos = idx + 1
+          }
+
+          page.cleanup()
+
+          if (!cancelled && (pageNumber === pdfDocumentProxy.numPages || pageNumber % 24 === 0)) {
+            startTransition(() => {
+              setPdfSearchMatchesState([...nextMatches])
+              setPdfSearchResultPreviewsState([...nextPreviews])
+            })
+          }
+
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, 0)
+          })
+        }
+      } finally {
+        if (!cancelled) {
+          setPdfSearchIndexing(false)
+        }
+      }
+    }
+
+    void loadPdfSearchIndex()
+
+    return () => {
+      cancelled = true
+      setPdfSearchIndexing(false)
+    }
+  }, [
+    pdfNativeSearchTextError,
+    pdfNativeSearchTextPages,
+    nativePdfSearchTextSupported,
+    pdfDocumentProxy,
+    pdfSearchIndexRequested,
+    searchQuery,
+  ])
+
+  useEffect(() => {
+    if (!tauriAvailable || !loadedDocument || !isMarkdownDocument(loadedDocument) || documentMode !== 'edit') {
+      return
+    }
+
+    const nextSource = markdownSource
+    const fileName = loadedDocument.fileName
+    const filePath = loadedDocument.filePath
+    const requestId = ++markdownParseRequestRef.current
+    const timer = window.setTimeout(() => {
+      void parseMarkdownSource(fileName, filePath, nextSource)
+        .then((document) => {
+          if (markdownParseRequestRef.current !== requestId) {
+            return
+          }
+          startTransition(() => {
+            setLoadedDocument(document)
+          })
+        })
+        .catch((error) => {
+          if (markdownParseRequestRef.current !== requestId) {
+            return
+          }
+          setOpenError(error instanceof Error ? error.message : String(error))
+        })
+    }, 180)
+
+    return () => window.clearTimeout(timer)
+  }, [documentMode, loadedDocument?.fileName, loadedDocument?.filePath, markdownSource, tauriAvailable])
 
   useEffect(() => {
     const pageWorkspace = pageWorkspaceRef.current
@@ -2882,6 +4404,45 @@ function App() {
 
   useLayoutEffect(() => {
     if (!deferredDocument) {
+      setWorkspaceViewportHeight(null)
+      return
+    }
+
+    let rafId = 0
+    const updateViewportHeight = () => {
+      const stack = pageStackRef.current
+      if (!stack) {
+        return
+      }
+
+      const rect = stack.getBoundingClientRect()
+      const topInset = Math.max(rect.top, 0)
+      setWorkspaceViewportHeight(Math.max(220, window.innerHeight - topInset - 24))
+    }
+
+    const scheduleUpdate = () => {
+      if (rafId) {
+        cancelAnimationFrame(rafId)
+      }
+      rafId = requestAnimationFrame(updateViewportHeight)
+    }
+
+    scheduleUpdate()
+    window.addEventListener('resize', scheduleUpdate)
+    return () => {
+      if (rafId) {
+        cancelAnimationFrame(rafId)
+      }
+      window.removeEventListener('resize', scheduleUpdate)
+    }
+  }, [deferredDocument, pageColumns, searchOpen])
+
+  useEffect(() => {
+    setFitViewportCorrection(1)
+  }, [deferredDocument, pageColumns, workspaceWidth, workspaceViewportHeight])
+
+  useLayoutEffect(() => {
+    if (!deferredDocument) {
       setRenderedPages([])
       return
     }
@@ -2890,7 +4451,7 @@ function App() {
     let nextDisplayPageNumber = deferredDocument.document.sections[0]?.pageStartNumber ?? 1
 
     for (const section of deferredDocument.document.sections) {
-      const zoomFactor = resolveZoomFactor(section.pageLayout, zoomPreset, workspaceWidth)
+      const paginationZoomFactor = 1
       const measureRoot = measureRefs.current[section.id]
       const bodyRoot = measureRoot?.querySelector<HTMLElement>('[data-region="body"]')
       const headerRoot = measureRoot?.querySelector<HTMLElement>('[data-region="header"]')
@@ -2903,11 +4464,11 @@ function App() {
       if (blockNodes.length > 0) {
         const availableHeight = Math.max(
           120,
-          pageInnerHeight(section.pageLayout, zoomFactor) -
-            (headerRoot?.offsetHeight ?? 0) -
-            (footerRoot?.offsetHeight ?? 0),
+          pageInnerHeight(section.pageLayout, paginationZoomFactor) -
+            measuredElementHeight(headerRoot) -
+            measuredElementHeight(footerRoot),
         )
-        const paginationItems = measurePaginationItems(section, blockNodes, zoomFactor)
+        const paginationItems = measurePaginationItems(section, blockNodes, paginationZoomFactor)
         groups = paginateSectionBlocks(paginationItems, availableHeight)
       }
 
@@ -2936,7 +4497,7 @@ function App() {
     }
 
     setRenderedPages(pages)
-  }, [deferredDocument, workspaceWidth, zoomPreset, renderedPages.length])
+  }, [deferredDocument, workspaceWidth])
 
   async function handleOpenDocument() {
     if (!tauriAvailable) {
@@ -2957,7 +4518,7 @@ function App() {
 
       startTransition(() => {
         setLoadedDocument(document)
-        saveRecentFile(document.fileName)
+        saveRecentFile(document.fileName, document.filePath)
         setRecentFiles(loadRecentFiles())
       })
     } catch (error) {
@@ -2970,8 +4531,8 @@ function App() {
   async function handleFileDrop(file: File) {
     if (!tauriAvailable) return
     const ext = file.name.split('.').pop()?.toLowerCase()
-    if (ext !== 'hwp' && ext !== 'hwpx') {
-      setOpenError('지원하지 않는 파일 형식입니다. .hwp 또는 .hwpx 파일을 사용하세요.')
+    if (ext !== 'hwp' && ext !== 'hwpx' && ext !== 'md' && ext !== 'markdown' && ext !== 'pdf') {
+      setOpenError('지원하지 않는 파일 형식입니다. .hwp, .hwpx, .md, 또는 .pdf 파일을 사용하세요.')
       return
     }
     setOpening(true)
@@ -2982,7 +4543,7 @@ function App() {
       if (document) {
         startTransition(() => {
           setLoadedDocument(document)
-          saveRecentFile(document.fileName)
+          saveRecentFile(document.fileName, document.filePath)
           setRecentFiles(loadRecentFiles())
         })
       }
@@ -2993,22 +4554,386 @@ function App() {
     }
   }
 
+  async function handleRecentOpen(file: RecentFile) {
+    if (!tauriAvailable) {
+      setOpenError('최근 문서 다시 열기는 desktop 앱에서만 지원합니다.')
+      return
+    }
+
+    setOpening(true)
+    setOpenError(null)
+
+    try {
+      const document = await openWithPath(file.path)
+      if (!document) {
+        return
+      }
+
+      startTransition(() => {
+        setLoadedDocument(document)
+        saveRecentFile(document.fileName, document.filePath)
+        setRecentFiles(loadRecentFiles())
+      })
+    } catch (error) {
+      removeRecentFile(file.path)
+      setRecentFiles(loadRecentFiles())
+      setOpenError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setOpening(false)
+    }
+  }
+
+  async function handleSaveMarkdown(saveAs: boolean) {
+    if (!tauriAvailable || !loadedDocument || !isMarkdownDocument(loadedDocument)) {
+      return
+    }
+
+    setSavingMarkdown(true)
+    setOpenError(null)
+
+    try {
+      const savedDocument = saveAs || !loadedDocument.filePath
+        ? await saveMarkdownSourceAs(loadedDocument.fileName, markdownSource)
+        : await saveMarkdownSource(loadedDocument.filePath, markdownSource)
+
+      if (!savedDocument) {
+        return
+      }
+
+      markdownIdentityRef.current = markdownDocumentIdentity(savedDocument)
+      startTransition(() => {
+        setLoadedDocument(savedDocument)
+        setSavedMarkdownSource(savedDocument.sourceText ?? markdownSource)
+        setMarkdownSource(savedDocument.sourceText ?? markdownSource)
+        saveRecentFile(savedDocument.fileName, savedDocument.filePath)
+        setRecentFiles(loadRecentFiles())
+      })
+    } catch (error) {
+      setOpenError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSavingMarkdown(false)
+    }
+  }
+
+  async function handlePrintDocument() {
+    if (printing) {
+      return
+    }
+
+    setPrinting(true)
+    setOpenError(null)
+
+    try {
+      if (tauriAvailable) {
+        await printCurrentDocument()
+      } else {
+        window.print()
+      }
+    } catch (error) {
+      setOpenError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setPrinting(false)
+    }
+  }
+
+  async function handleDocumentModeChange(nextMode: 'view' | 'edit') {
+    if (
+      nextMode === 'view' &&
+      tauriAvailable &&
+      loadedDocument &&
+      isMarkdownDocument(loadedDocument) &&
+      markdownSource !== loadedDocument.sourceText
+    ) {
+      try {
+        const requestId = ++markdownParseRequestRef.current
+        const parsed = await parseMarkdownSource(
+          loadedDocument.fileName,
+          loadedDocument.filePath,
+          markdownSource,
+        )
+        if (markdownParseRequestRef.current === requestId) {
+          startTransition(() => {
+            setLoadedDocument(parsed)
+          })
+        }
+      } catch (error) {
+        setOpenError(error instanceof Error ? error.message : String(error))
+      }
+    }
+
+    setDocumentMode(nextMode)
+  }
+
   const activeDocument = deferredDocument
+  const pdfDocumentActive = isPdfDocument(activeDocument)
   const documentAssets = activeDocument?.document.assets ?? []
   const title = activeDocument?.document.metadata.title ?? activeDocument?.fileName
-  const totalPages = renderedPages.length > 0 ? renderedPages.length : activeDocument?.document.sections.length ?? 0
+  const pageCount = pdfDocumentActive
+    ? (pdfPageMetrics.length || activeDocument?.document.metadata.pageCount || 0)
+    : (renderedPages.length > 0 ? renderedPages.length : activeDocument?.document.sections.length ?? 0)
+  const totalPages = pageCount
+  const renderedPageCount = pdfDocumentActive ? pdfPageMetrics.length : renderedPages.length
+  const displayedZoomPercent = zoomMode === 'fitWidth' ? 100 : zoomPercent
+  const showScrollStatus = scrollStatus.horizontalOverflow || scrollStatus.verticalOverflow
+  const markdownEditable = activeDocument?.isEditable && isMarkdownDocument(activeDocument)
+  const markdownDirty = markdownEditable && markdownSource !== savedMarkdownSource
+  const showViewerChrome = !(markdownEditable && documentMode === 'edit')
+
+  const captureViewportAnchor = useCallback((): ViewportPageAnchor | null => {
+    const pages = Array.from(
+      pageWorkspaceRef.current?.querySelectorAll<HTMLElement>('[data-page-number]') ?? [],
+    )
+    if (pages.length === 0) {
+      return null
+    }
+
+    const viewportCenter = window.innerHeight / 2
+    let bestMatch: { score: number; anchor: ViewportPageAnchor } | null = null
+
+    for (const page of pages) {
+      const rect = page.getBoundingClientRect()
+      if (rect.height <= 0) {
+        continue
+      }
+
+      const visibleHeight = Math.max(0, Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0))
+      const pageCenter = rect.top + rect.height / 2
+      const centerDistance = Math.abs(pageCenter - viewportCenter)
+      const score = visibleHeight * 10 - centerDistance
+      const pageNumber = Number(page.dataset.pageNumber ?? '0')
+      if (!Number.isFinite(pageNumber) || pageNumber <= 0) {
+        continue
+      }
+
+      const anchor = {
+        pageNumber,
+        relativeOffset: clampNumber((viewportCenter - rect.top) / rect.height, 0, 1),
+      }
+
+      if (!bestMatch || score > bestMatch.score) {
+        bestMatch = { score, anchor }
+      }
+    }
+
+    return bestMatch?.anchor ?? null
+  }, [])
+
+  const restoreViewportAnchor = useCallback((anchor: ViewportPageAnchor | null) => {
+    if (!anchor) {
+      return
+    }
+
+    requestAnimationFrame(() => {
+      const page = pageWorkspaceRef.current?.querySelector<HTMLElement>(
+        `[data-page-number="${anchor.pageNumber}"]`,
+      )
+      if (!page) {
+        return
+      }
+
+      const rect = page.getBoundingClientRect()
+      const absoluteTop = window.scrollY + rect.top
+      const targetTop = absoluteTop + rect.height * anchor.relativeOffset - window.innerHeight / 2
+      window.scrollTo({ top: Math.max(0, targetTop), behavior: 'auto' })
+    })
+  }, [])
+
+  const rememberViewportAnchor = useCallback(() => {
+    pendingViewportAnchorRef.current = captureViewportAnchor()
+  }, [captureViewportAnchor])
+
+  const setManualZoom = useCallback(
+    (nextPercent: number) => {
+      rememberViewportAnchor()
+      setZoomMode('manual')
+      setZoomPercent(clampNumber(nextPercent, MIN_ZOOM_PERCENT, MAX_ZOOM_PERCENT))
+    },
+    [rememberViewportAnchor],
+  )
+
+  const adjustZoom = useCallback(
+    (delta: number) => {
+      const basePercent = zoomMode === 'fitWidth' ? 100 : zoomPercent
+      setManualZoom(basePercent + delta)
+    },
+    [displayedZoomPercent, setManualZoom, zoomMode, zoomPercent],
+  )
+
+  const activateFitWidth = useCallback(() => {
+    rememberViewportAnchor()
+    setZoomMode('fitWidth')
+  }, [rememberViewportAnchor])
+
+  const setViewMode = useCallback(
+    (nextMode: PageViewMode) => {
+      rememberViewportAnchor()
+      setPageViewMode(nextMode)
+    },
+    [rememberViewportAnchor],
+  )
 
   // --- Keyboard shortcuts ---
-  const scrollToPage = useCallback((pageNum: number) => {
+  const scrollToPage = useCallback((pageNum: number, options?: ScrollIntoViewOptions) => {
     const el = pageWorkspaceRef.current?.querySelector(`[data-page-number="${pageNum}"]`)
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    if (el) {
+      el.scrollIntoView({
+        behavior: 'smooth',
+        block: 'start',
+        inline: 'nearest',
+        ...options,
+      })
+    }
   }, [])
 
   useEffect(() => {
+    if (renderedPageCount === 0) {
+      setActivePageNumber(1)
+      return
+    }
+
+    let rafId = 0
+    const updateActivePage = () => {
+      const anchor = captureViewportAnchor()
+      if (anchor) {
+        setActivePageNumber(anchor.pageNumber)
+      }
+    }
+    const scheduleUpdate = () => {
+      if (rafId) {
+        cancelAnimationFrame(rafId)
+      }
+      rafId = requestAnimationFrame(updateActivePage)
+    }
+
+    scheduleUpdate()
+    window.addEventListener('scroll', scheduleUpdate, { passive: true })
+    window.addEventListener('resize', scheduleUpdate)
+    return () => {
+      if (rafId) {
+        cancelAnimationFrame(rafId)
+      }
+      window.removeEventListener('scroll', scheduleUpdate)
+      window.removeEventListener('resize', scheduleUpdate)
+    }
+  }, [captureViewportAnchor, renderedPageCount, pageColumns, zoomMode, zoomPercent])
+
+  useEffect(() => {
+    if (!activeDocument) {
+      setScrollStatus({
+        horizontalOverflow: false,
+        horizontalProgress: 0,
+        verticalOverflow: false,
+        verticalProgress: 0,
+      })
+      return
+    }
+
+    let rafId = 0
+    const updateScrollStatus = () => {
+      const stack = pageStackRef.current
+      const horizontalMax = stack ? Math.max(0, stack.scrollWidth - stack.clientWidth) : 0
+      const verticalMax = Math.max(
+        0,
+        document.documentElement.scrollHeight - window.innerHeight,
+      )
+
+      setScrollStatus({
+        horizontalOverflow: horizontalMax > 0,
+        horizontalProgress: horizontalMax > 0 ? clampNumber(stack!.scrollLeft / horizontalMax, 0, 1) : 0,
+        verticalOverflow: verticalMax > 0,
+        verticalProgress: verticalMax > 0 ? clampNumber(window.scrollY / verticalMax, 0, 1) : 0,
+      })
+    }
+
+    const scheduleUpdate = () => {
+      if (rafId) {
+        cancelAnimationFrame(rafId)
+      }
+      rafId = requestAnimationFrame(updateScrollStatus)
+    }
+
+    scheduleUpdate()
+    const stack = pageStackRef.current
+    stack?.addEventListener('scroll', scheduleUpdate, { passive: true })
+    window.addEventListener('scroll', scheduleUpdate, { passive: true })
+    window.addEventListener('resize', scheduleUpdate)
+    return () => {
+      if (rafId) {
+        cancelAnimationFrame(rafId)
+      }
+      stack?.removeEventListener('scroll', scheduleUpdate)
+      window.removeEventListener('scroll', scheduleUpdate)
+      window.removeEventListener('resize', scheduleUpdate)
+    }
+  }, [activeDocument, pageColumns, renderedPageCount, zoomMode, zoomPercent])
+
+  useLayoutEffect(() => {
+    if (!pendingViewportAnchorRef.current) {
+      return
+    }
+
+    const anchor = pendingViewportAnchorRef.current
+    pendingViewportAnchorRef.current = null
+    restoreViewportAnchor(anchor)
+  }, [restoreViewportAnchor, zoomMode, zoomPercent, pageColumns, renderedPageCount])
+
+  useLayoutEffect(() => {
+    if (zoomMode !== 'fitWidth' || pageColumns <= 1 || renderedPageCount === 0) {
+      return
+    }
+
+    let rafId = 0
+    const adjustFitCorrection = () => {
+      const rowPages = Array.from(
+        pageStackRef.current?.querySelectorAll<HTMLElement>('.paper-page[data-page-number]') ?? [],
+      ).slice(0, pageColumns)
+      if (rowPages.length === 0) {
+        return
+      }
+
+      const tops = rowPages.map((page) => page.getBoundingClientRect().top)
+      const bottoms = rowPages.map((page) => page.getBoundingClientRect().bottom)
+      const rowTop = Math.min(...tops)
+      const rowBottom = Math.max(...bottoms)
+      const availableBottom = window.innerHeight - 24
+      const availableHeight = availableBottom - rowTop
+      const rowHeight = rowBottom - rowTop
+
+      if (!(availableHeight > 0) || !(rowHeight > 0)) {
+        return
+      }
+
+      const ratio = availableHeight / rowHeight
+      if (ratio >= 0.995) {
+        return
+      }
+
+      setFitViewportCorrection((prev) => {
+        const next = clampNumber(prev * Math.max(0.5, ratio), 0.18, 1)
+        return Math.abs(next - prev) >= 0.005 ? next : prev
+      })
+    }
+
+    rafId = requestAnimationFrame(adjustFitCorrection)
+    return () => {
+      if (rafId) {
+        cancelAnimationFrame(rafId)
+      }
+    }
+  }, [fitViewportCorrection, pageColumns, renderedPageCount, zoomMode])
+
+  useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        if (markdownEditable) {
+          e.preventDefault()
+          void handleSaveMarkdown(false)
+          return
+        }
+      }
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
         e.preventDefault()
-        if (deferredDocument) {
+        if (deferredDocument && !(markdownEditable && documentMode === 'edit')) {
           setSearchOpen(true)
           setTimeout(() => searchInputRef.current?.focus(), 0)
         }
@@ -3017,24 +4942,46 @@ function App() {
         setSearchOpen(false)
         setSearchQuery('')
         setSearchMatchIndex(0)
+        setSearchNavigationRequest(null)
+      }
+      if ((e.ctrlKey || e.metaKey) && (e.key === '=' || e.key === '+')) {
+        e.preventDefault()
+        adjustZoom(ZOOM_STEP_PERCENT)
+        return
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === '-') {
+        e.preventDefault()
+        adjustZoom(-ZOOM_STEP_PERCENT)
+        return
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === '0') {
+        e.preventDefault()
+        activateFitWidth()
+        return
       }
       // Page navigation
-      if (!searchOpen && deferredDocument && !(e.target instanceof HTMLInputElement)) {
+      if (
+        !searchOpen &&
+        deferredDocument &&
+        !(markdownEditable && documentMode === 'edit') &&
+        !(e.target instanceof HTMLInputElement) &&
+        !(e.target instanceof HTMLTextAreaElement)
+      ) {
         if (e.key === 'PageDown' || (e.key === ' ' && !e.shiftKey)) {
           e.preventDefault()
-          pageWorkspaceRef.current?.scrollBy({ top: window.innerHeight * 0.8, behavior: 'smooth' })
+          window.scrollBy({ top: window.innerHeight * 0.8, behavior: 'smooth' })
         }
         if (e.key === 'PageUp' || (e.key === ' ' && e.shiftKey)) {
           e.preventDefault()
-          pageWorkspaceRef.current?.scrollBy({ top: -window.innerHeight * 0.8, behavior: 'smooth' })
+          window.scrollBy({ top: -window.innerHeight * 0.8, behavior: 'smooth' })
         }
         if (e.key === 'Home') {
           e.preventDefault()
-          pageWorkspaceRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
+          window.scrollTo({ top: 0, behavior: 'smooth' })
         }
         if (e.key === 'End') {
           e.preventDefault()
-          pageWorkspaceRef.current?.scrollTo({ top: pageWorkspaceRef.current.scrollHeight, behavior: 'smooth' })
+          window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'smooth' })
         }
         if ((e.ctrlKey || e.metaKey) && e.key === 'g') {
           e.preventDefault()
@@ -3048,42 +4995,230 @@ function App() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [deferredDocument, searchOpen, totalPages, scrollToPage])
+  }, [activateFitWidth, adjustZoom, deferredDocument, searchOpen, totalPages, scrollToPage, markdownEditable, documentMode, handleSaveMarkdown])
+
+  const effectiveSearchQuery = useMemo(
+    () => (pdfDocumentActive ? compactPdfSearchText(searchQuery) : searchQuery.toLowerCase()),
+    [pdfDocumentActive, searchQuery],
+  )
 
   const searchMatches = useMemo(() => {
-    if (!searchQuery || searchQuery.length < 2 || renderedPages.length === 0) return []
-    const query = searchQuery.toLowerCase()
-    const matches: Array<{ pageIndex: number; blockIndex: number; runIndex: number; start: number; length: number }> = []
+    if (!effectiveSearchQuery || effectiveSearchQuery.length < 2) {
+      return [] as SearchMatch[]
+    }
+
+    if (pdfDocumentActive) {
+      return pdfSearchMatchesState
+    }
+
+    const query = effectiveSearchQuery
+    const matches: SearchMatch[] = []
+
+    if (renderedPages.length === 0) {
+      return matches
+    }
+
     renderedPages.forEach((page, pageIndex) => {
       page.blocks.forEach((block, blockIndex) => {
-        if (block.type === 'paragraph') {
-          block.value.runs.forEach((run, runIndex) => {
-            const text = run.text.toLowerCase()
-            let pos = 0
-            while (pos < text.length) {
-              const idx = text.indexOf(query, pos)
-              if (idx === -1) break
-              matches.push({ pageIndex, blockIndex, runIndex, start: idx, length: query.length })
-              pos = idx + 1
-            }
-          })
+        if (block.type !== 'paragraph') {
+          return
         }
+        block.value.runs.forEach((run, runIndex) => {
+          const text = run.text.toLowerCase()
+          let pos = 0
+          while (pos < text.length) {
+            const idx = text.indexOf(query, pos)
+            if (idx === -1) break
+            matches.push({
+              pageIndex,
+              pageNumber: page.displayPageNumber,
+              blockIndex,
+              runIndex,
+              start: idx,
+              length: query.length,
+              matchGlobalIndex: matches.length,
+            })
+            pos = idx + 1
+          }
+        })
       })
     })
     return matches
-  }, [searchQuery, renderedPages])
+  }, [effectiveSearchQuery, pdfDocumentActive, pdfSearchMatchesState, renderedPages])
+  const activePdfSearchPageNumber = pdfDocumentActive ? searchMatches[searchMatchIndex]?.pageNumber ?? null : null
+  const pdfMaterializedPageNumbers = useMemo(() => {
+    if (!pdfDocumentActive) {
+      return new Set<number>()
+    }
+
+    const totalPdfPages = pdfPageMetrics.length
+    if (totalPdfPages <= 24) {
+      return new Set(pdfPageMetrics.map((page) => page.pageNumber))
+    }
+
+    const pageWindow = new Set<number>()
+    const anchors = new Set<number>([clampNumber(activePageNumber, 1, totalPdfPages)])
+    if (activePdfSearchPageNumber) {
+      anchors.add(clampNumber(activePdfSearchPageNumber, 1, totalPdfPages))
+    }
+
+    const behind = Math.max(pageColumns * 2, 4)
+    const ahead = Math.max(pageColumns * 4, 10)
+
+    for (const anchor of anchors) {
+      const start = Math.max(1, anchor - behind)
+      const end = Math.min(totalPdfPages, anchor + ahead)
+      for (let pageNumber = start; pageNumber <= end; pageNumber += 1) {
+        pageWindow.add(pageNumber)
+      }
+    }
+
+    return pageWindow
+  }, [activePageNumber, activePdfSearchPageNumber, pageColumns, pdfDocumentActive, pdfPageMetrics])
 
   useEffect(() => {
-    if (searchMatches.length > 0 && searchMatchIndex >= 0) {
-      const el = document.querySelector(`[data-search-match="${searchMatchIndex}"]`)
-      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (searchMatches.length === 0) {
+      if (searchMatchIndex !== 0) {
+        setSearchMatchIndex(0)
+      }
+      return
+    }
+
+    if (searchMatchIndex >= searchMatches.length) {
+      setSearchMatchIndex(searchMatches.length - 1)
     }
   }, [searchMatchIndex, searchMatches.length])
+
+  useEffect(() => {
+    if (!searchNavigationRequest) {
+      return
+    }
+
+    if (
+      searchNavigationRequest.index < 0 ||
+      searchNavigationRequest.index >= searchMatches.length
+    ) {
+      return
+    }
+
+    const activeMatch = searchMatches[searchNavigationRequest.index]
+    setSearchNavigationRequest(null)
+    if (pdfDocumentActive) {
+      scrollToPage(activeMatch.pageNumber, { behavior: 'smooth', block: 'center' })
+    }
+
+    let cancelled = false
+    let attempt = 0
+
+    const scrollToMatch = () => {
+      if (cancelled) {
+        return
+      }
+
+      const el = document.querySelector(
+        `[data-search-match="${searchNavigationRequest.index}"]`,
+      )
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' })
+        return
+      }
+
+      if (attempt >= 16) {
+        return
+      }
+
+      attempt += 1
+      requestAnimationFrame(scrollToMatch)
+    }
+
+    scrollToMatch()
+
+    return () => {
+      cancelled = true
+    }
+  }, [pdfDocumentActive, scrollToPage, searchMatches, searchNavigationRequest])
+
+  const pdfSearchMatchesByPageNumber = useMemo(() => {
+    const pageMatches = new Map<number, SearchMatch[]>()
+    if (!pdfDocumentActive) {
+      return pageMatches
+    }
+
+    for (const match of searchMatches) {
+      const existing = pageMatches.get(match.pageNumber)
+      if (existing) {
+        existing.push(match)
+      } else {
+        pageMatches.set(match.pageNumber, [match])
+      }
+    }
+
+    return pageMatches
+  }, [pdfDocumentActive, searchMatches])
+
+  const searchResultPreviews = useMemo(() => {
+    if (!effectiveSearchQuery || effectiveSearchQuery.length < 2) {
+      return [] as SearchResultPreview[]
+    }
+
+    if (pdfDocumentActive) {
+      return pdfSearchResultPreviewsState
+    }
+
+    return searchMatches.slice(0, 100).map((match) => {
+      let sourceText = ''
+
+      const block = renderedPages[match.pageIndex]?.blocks[match.blockIndex ?? -1]
+      if (block?.type === 'paragraph') {
+        if (match.runIndex != null) {
+          sourceText = block.value.runs[match.runIndex]?.text ?? ''
+        } else {
+          sourceText = block.value.runs.map((run) => run.text).join('')
+        }
+      }
+
+      const { before, matchText, after } = buildSearchSnippet(sourceText, match.start, match.length)
+      return {
+        matchGlobalIndex: match.matchGlobalIndex,
+        pageNumber: match.pageNumber,
+        before,
+        matchText,
+        after,
+      }
+    })
+  }, [effectiveSearchQuery, pdfDocumentActive, pdfSearchResultPreviewsState, renderedPages, searchMatches])
+
+  const setSearchSelection = useCallback((nextIndex: number, navigate = false) => {
+    setSearchMatchIndex(nextIndex)
+    if (navigate) {
+      setSearchNavigationRequest((prev) => ({
+        index: nextIndex,
+        token: (prev?.token ?? 0) + 1,
+      }))
+    }
+  }, [])
+
+  const moveSearchSelection = useCallback((delta: number, navigate = false) => {
+    if (searchMatches.length === 0) {
+      return
+    }
+
+    const nextIndex = (searchMatchIndex + delta + searchMatches.length) % searchMatches.length
+    setSearchSelection(nextIndex, navigate)
+  }, [searchMatchIndex, searchMatches.length, setSearchSelection])
 
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sidebarTab, setSidebarTab] = useState<'toc' | 'thumbnails'>('toc')
 
   const tocEntries = useMemo(() => {
+    if (pdfDocumentActive) {
+      return pdfOutlineEntries.map((entry) => ({
+        text: entry.text,
+        level: entry.level,
+        pageNumber: entry.pageNumber,
+      }))
+    }
+
     if (!renderedPages.length) return []
     const entries: Array<{ text: string; level: number; pageNumber: number }> = []
     renderedPages.forEach((page) => {
@@ -3096,7 +5231,35 @@ function App() {
       })
     })
     return entries
-  }, [renderedPages])
+  }, [pdfDocumentActive, pdfOutlineEntries, renderedPages])
+
+  const hasTocEntries = tocEntries.length > 0
+  const hasThumbnailEntries = totalPages > 1
+  const hasSidebarContent = hasTocEntries || hasThumbnailEntries
+  const sidebarToggleLabel = sidebarOpen
+    ? '패널 닫기'
+    : hasTocEntries && hasThumbnailEntries
+      ? '목차/썸네일'
+      : hasTocEntries
+        ? '목차'
+        : '썸네일'
+
+  useEffect(() => {
+    if (!hasSidebarContent) {
+      setSidebarOpen(false)
+    }
+  }, [hasSidebarContent])
+
+  useEffect(() => {
+    if (sidebarTab === 'toc' && !hasTocEntries && hasThumbnailEntries) {
+      setSidebarTab('thumbnails')
+      return
+    }
+
+    if (sidebarTab === 'thumbnails' && !hasThumbnailEntries && hasTocEntries) {
+      setSidebarTab('toc')
+    }
+  }, [hasThumbnailEntries, hasTocEntries, sidebarTab])
 
   return (
     <main
@@ -3114,9 +5277,9 @@ function App() {
         <div className="brand-lockup">
           <img className="brand-mark" src="/max-viewer-logo.svg" alt="MAX Viewer logo" />
           <div className="title-wrap">
-            <p className="app-kicker">HWP / HWPX Viewer</p>
+            <p className="app-kicker">HWP / HWPX / MD / PDF Viewer</p>
             <h1>MAX Viewer</h1>
-            <p className="app-subtitle">한컴 문서를 페이지 형태로 읽는 뷰어</p>
+            <p className="app-subtitle">한컴 문서와 Markdown을 페이지 형태로 읽고 편집하는 뷰어</p>
           </div>
         </div>
 
@@ -3124,62 +5287,173 @@ function App() {
           {activeDocument ? (
             <div className="toolbar-group">
               <span className="meta-pill">{activeDocument.fileName}</span>
-              <span className="meta-pill page-nav">
-                쪽 <input
-                  className="page-jump-input"
-                  type="number"
-                  min={1}
-                  max={totalPages}
-                  defaultValue={1}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      const num = parseInt((e.target as HTMLInputElement).value, 10)
-                      if (num >= 1 && num <= totalPages) scrollToPage(num)
-                    }
-                  }}
-                /> / {totalPages}
-              </span>
-              <div className="zoom-controls" role="group" aria-label="배율 선택">
-                <button
-                  type="button"
-                  className={`secondary-button ${zoomPreset === 'fitWidth' ? 'active' : ''}`}
-                  onClick={() => setZoomPreset('fitWidth')}
-                >
-                  폭 맞춤
-                </button>
-                <button
-                  type="button"
-                  className={`secondary-button ${zoomPreset === '100' ? 'active' : ''}`}
-                  onClick={() => setZoomPreset('100')}
-                >
-                  100%
-                </button>
-                <button
-                  type="button"
-                  className={`secondary-button ${zoomPreset === '125' ? 'active' : ''}`}
-                  onClick={() => setZoomPreset('125')}
-                >
-                  125%
-                </button>
-                <button
-                  type="button"
-                  className={`secondary-button ${zoomPreset === '150' ? 'active' : ''}`}
-                  onClick={() => setZoomPreset('150')}
-                >
-                  150%
-                </button>
-              </div>
+              {showViewerChrome ? (
+                <>
+                  <span className="meta-pill page-nav">
+                    쪽 <input
+                      className="page-jump-input"
+                      type="number"
+                      min={1}
+                      max={totalPages}
+                      defaultValue={activePageNumber}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          const num = parseInt((e.target as HTMLInputElement).value, 10)
+                          if (num >= 1 && num <= totalPages) scrollToPage(num)
+                        }
+                      }}
+                    /> / {totalPages}
+                  </span>
+                  <span className="meta-pill">현재 {activePageNumber}쪽</span>
+                  <div className="view-mode-controls" role="group" aria-label="페이지 보기 모드">
+                    <button
+                      type="button"
+                      className={`secondary-button ${pageViewMode === 'single' ? 'active' : ''}`}
+                      onClick={() => setViewMode('single')}
+                    >
+                      1쪽
+                    </button>
+                    <button
+                      type="button"
+                      className={`secondary-button ${pageViewMode === 'twoUp' ? 'active' : ''}`}
+                      onClick={() => setViewMode('twoUp')}
+                    >
+                      2쪽
+                    </button>
+                    <button
+                      type="button"
+                      className={`secondary-button ${pageViewMode === 'fourUp' ? 'active' : ''}`}
+                      onClick={() => setViewMode('fourUp')}
+                    >
+                      4쪽
+                    </button>
+                  </div>
+                  <div className="zoom-controls" role="group" aria-label="배율 선택">
+                    <button
+                      type="button"
+                      className={`secondary-button ${zoomMode === 'fitWidth' ? 'active' : ''}`}
+                      onClick={activateFitWidth}
+                    >
+                      폭 맞춤
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button zoom-step-button"
+                      onClick={() => adjustZoom(-ZOOM_STEP_PERCENT)}
+                    >
+                      -
+                    </button>
+                    <span className="meta-pill zoom-readout">{displayedZoomPercent}%</span>
+                    <button
+                      type="button"
+                      className="secondary-button zoom-step-button"
+                      onClick={() => adjustZoom(ZOOM_STEP_PERCENT)}
+                    >
+                      +
+                    </button>
+                    <button
+                      type="button"
+                      className={`secondary-button ${zoomMode === 'manual' && zoomPercent === 100 ? 'active' : ''}`}
+                      onClick={() => setManualZoom(100)}
+                    >
+                      100%
+                    </button>
+                    <button
+                      type="button"
+                      className={`secondary-button ${zoomMode === 'manual' && zoomPercent === 125 ? 'active' : ''}`}
+                      onClick={() => setManualZoom(125)}
+                    >
+                      125%
+                    </button>
+                    <button
+                      type="button"
+                      className={`secondary-button ${zoomMode === 'manual' && zoomPercent === 150 ? 'active' : ''}`}
+                      onClick={() => setManualZoom(150)}
+                    >
+                      150%
+                    </button>
+                  </div>
+                  {showScrollStatus ? (
+                    <div className="scroll-status-panel" role="status" aria-live="polite">
+                      <div className="scroll-status-axis">
+                        <span className="scroll-status-label">가로</span>
+                        <div className="scroll-status-track">
+                          <div
+                            className="scroll-status-fill"
+                            style={{ width: `${Math.round(scrollStatus.horizontalProgress * 100)}%` }}
+                          />
+                        </div>
+                        <span className="scroll-status-value">
+                          {Math.round(scrollStatus.horizontalProgress * 100)}%
+                        </span>
+                      </div>
+                      <div className="scroll-status-axis">
+                        <span className="scroll-status-label">세로</span>
+                        <div className="scroll-status-track">
+                          <div
+                            className="scroll-status-fill"
+                            style={{ width: `${Math.round(scrollStatus.verticalProgress * 100)}%` }}
+                          />
+                        </div>
+                        <span className="scroll-status-value">
+                          {Math.round(scrollStatus.verticalProgress * 100)}%
+                        </span>
+                      </div>
+                    </div>
+                  ) : null}
+                </>
+              ) : null}
             </div>
           ) : null}
           {activeDocument ? (
             <>
-              <button
-                className="secondary-button"
-                type="button"
-                onClick={() => window.print()}
-              >
-                인쇄
-              </button>
+              {markdownEditable ? (
+                <>
+                  <div className="view-mode-controls" role="group" aria-label="문서 모드">
+                    <button
+                      className={`secondary-button ${documentMode === 'view' ? 'active' : ''}`}
+                      type="button"
+                      onClick={() => void handleDocumentModeChange('view')}
+                    >
+                      뷰어
+                    </button>
+                    <button
+                      className={`secondary-button ${documentMode === 'edit' ? 'active' : ''}`}
+                      type="button"
+                      onClick={() => void handleDocumentModeChange('edit')}
+                    >
+                      편집
+                    </button>
+                  </div>
+                  {markdownDirty ? <span className="meta-pill">미저장 변경</span> : null}
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => void handleSaveMarkdown(false)}
+                    disabled={savingMarkdown}
+                  >
+                    {savingMarkdown ? '저장 중...' : '저장'}
+                  </button>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => void handleSaveMarkdown(true)}
+                    disabled={savingMarkdown}
+                  >
+                    다른 이름으로 저장
+                  </button>
+                </>
+              ) : null}
+              {showViewerChrome ? (
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => void handlePrintDocument()}
+                  disabled={printing}
+                >
+                  {printing ? '인쇄 준비 중...' : '인쇄'}
+                </button>
+              ) : null}
               <button
                 className="secondary-button"
                 type="button"
@@ -3200,61 +5474,109 @@ function App() {
         </div>
       </header>
 
-      {searchOpen && activeDocument ? (
-        <div className="search-bar">
-          <input
-            ref={searchInputRef}
-            className="search-input"
-            type="text"
-            placeholder="검색어 입력 (2자 이상)"
-            value={searchQuery}
-            onChange={(e) => { setSearchQuery(e.target.value); setSearchMatchIndex(0) }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault()
-                if (e.shiftKey) {
-                  setSearchMatchIndex((prev) => (prev - 1 + searchMatches.length) % Math.max(1, searchMatches.length))
-                } else {
-                  setSearchMatchIndex((prev) => (prev + 1) % Math.max(1, searchMatches.length))
+      {searchOpen && activeDocument && !(markdownEditable && documentMode === 'edit') ? (
+        <div className="search-ui">
+          <div className="search-bar">
+            <input
+              ref={searchInputRef}
+              className="search-input"
+              type="text"
+              placeholder="검색어 입력 (2자 이상)"
+              value={searchQuery}
+              onChange={(e) => {
+                setSearchQuery(e.target.value)
+                setSearchMatchIndex(0)
+                setSearchNavigationRequest(null)
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  if (e.shiftKey) {
+                    moveSearchSelection(-1, true)
+                  } else {
+                    moveSearchSelection(1, true)
+                  }
                 }
-              }
-              if (e.key === 'Escape') {
+                if (e.key === 'Escape') {
+                  setSearchOpen(false)
+                  setSearchQuery('')
+                  setSearchMatchIndex(0)
+                  setSearchNavigationRequest(null)
+                }
+              }}
+            />
+            {effectiveSearchQuery.length >= 2 ? (
+              <span className="search-count">
+                {pdfDocumentActive && pdfSearchIndexing
+                  ? '검색 중...'
+                  : searchMatches.length > 0
+                  ? `${Math.min(searchMatchIndex + 1, searchMatches.length)} / ${searchMatches.length}`
+                  : '결과 없음'}
+              </span>
+            ) : null}
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => moveSearchSelection(-1, true)}
+              disabled={searchMatches.length === 0}
+            >
+              ▲
+            </button>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => moveSearchSelection(1, true)}
+              disabled={searchMatches.length === 0}
+            >
+              ▼
+            </button>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={() => {
                 setSearchOpen(false)
                 setSearchQuery('')
                 setSearchMatchIndex(0)
-              }
-            }}
-          />
-          {searchQuery.length >= 2 ? (
-            <span className="search-count">
-              {searchMatches.length > 0
-                ? `${searchMatchIndex + 1} / ${searchMatches.length}`
-                : '결과 없음'}
-            </span>
+                setSearchNavigationRequest(null)
+              }}
+            >
+              닫기
+            </button>
+          </div>
+          {effectiveSearchQuery.length >= 2 ? (
+            <div className="search-results-panel">
+              {pdfDocumentActive && pdfSearchIndexing && searchResultPreviews.length === 0 ? (
+                <div className="search-results-empty">PDF 검색 인덱스 생성 중...</div>
+              ) : searchResultPreviews.length > 0 ? (
+                <>
+                  <div className="search-results-list" role="listbox" aria-label="검색 결과 목록">
+                    {searchResultPreviews.map((result) => (
+                      <button
+                        key={result.matchGlobalIndex}
+                        className={`search-result-item${result.matchGlobalIndex === searchMatchIndex ? ' active' : ''}`}
+                        type="button"
+                        onClick={() => setSearchSelection(result.matchGlobalIndex, true)}
+                      >
+                        <span className="search-result-page">쪽 {result.pageNumber}</span>
+                        <span className="search-result-snippet">
+                          <span>{result.before}</span>
+                          <mark className="search-result-match">{result.matchText}</mark>
+                          <span>{result.after}</span>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  {searchMatches.length > searchResultPreviews.length ? (
+                    <div className="search-results-more">
+                      처음 {searchResultPreviews.length}개 결과만 표시 중
+                    </div>
+                  ) : null}
+                </>
+              ) : (
+                <div className="search-results-empty">검색 결과를 찾지 못했습니다.</div>
+              )}
+            </div>
           ) : null}
-          <button
-            className="secondary-button"
-            type="button"
-            onClick={() => setSearchMatchIndex((prev) => (prev - 1 + searchMatches.length) % Math.max(1, searchMatches.length))}
-            disabled={searchMatches.length === 0}
-          >
-            ▲
-          </button>
-          <button
-            className="secondary-button"
-            type="button"
-            onClick={() => setSearchMatchIndex((prev) => (prev + 1) % Math.max(1, searchMatches.length))}
-            disabled={searchMatches.length === 0}
-          >
-            ▼
-          </button>
-          <button
-            className="secondary-button"
-            type="button"
-            onClick={() => { setSearchOpen(false); setSearchQuery(''); setSearchMatchIndex(0) }}
-          >
-            닫기
-          </button>
         </div>
       ) : null}
 
@@ -3262,71 +5584,80 @@ function App() {
 
       {activeDocument ? (
         <section className="document-stage">
-          {activeDocument ? (
+          {activeDocument && showViewerChrome && hasSidebarContent ? (
             <button
               className="secondary-button sidebar-toggle"
               type="button"
               onClick={() => setSidebarOpen((v) => !v)}
             >
-              {sidebarOpen ? '패널 닫기' : '목차/썸네일'}
+              {sidebarToggleLabel}
             </button>
           ) : null}
 
-          {sidebarOpen ? (
+          {sidebarOpen && showViewerChrome && hasSidebarContent ? (
             <aside className="document-sidebar">
-              <div className="sidebar-tabs">
-                <button
-                  className={`sidebar-tab ${sidebarTab === 'toc' ? 'active' : ''}`}
-                  type="button"
-                  onClick={() => setSidebarTab('toc')}
-                >
-                  목차
-                </button>
-                <button
-                  className={`sidebar-tab ${sidebarTab === 'thumbnails' ? 'active' : ''}`}
-                  type="button"
-                  onClick={() => setSidebarTab('thumbnails')}
-                >
-                  썸네일
-                </button>
-              </div>
-              {sidebarTab === 'toc' ? (
+              {hasTocEntries && hasThumbnailEntries ? (
+                <div className="sidebar-tabs">
+                  <button
+                    className={`sidebar-tab ${sidebarTab === 'toc' ? 'active' : ''}`}
+                    type="button"
+                    onClick={() => setSidebarTab('toc')}
+                  >
+                    목차
+                  </button>
+                  <button
+                    className={`sidebar-tab ${sidebarTab === 'thumbnails' ? 'active' : ''}`}
+                    type="button"
+                    onClick={() => setSidebarTab('thumbnails')}
+                  >
+                    썸네일
+                  </button>
+                </div>
+              ) : null}
+              {sidebarTab === 'toc' && hasTocEntries ? (
                 <nav className="toc-panel">
-                  {tocEntries.length > 0 ? (
-                    <ul className="toc-list">
-                      {tocEntries.map((entry, i) => (
-                        <li
-                          key={i}
-                          className="toc-item"
-                          style={{ paddingLeft: `${entry.level * 1}rem` }}
+                  <ul className="toc-list">
+                    {tocEntries.map((entry, i) => (
+                      <li
+                        key={i}
+                        className="toc-item"
+                        style={{ paddingLeft: `${entry.level * 1}rem` }}
+                      >
+                        <button
+                          className="toc-link"
+                          type="button"
+                          onClick={() => scrollToPage(entry.pageNumber)}
                         >
-                          <button
-                            className="toc-link"
-                            type="button"
-                            onClick={() => scrollToPage(entry.pageNumber)}
-                          >
-                            {entry.text}
-                          </button>
-                          <span className="toc-page">{entry.pageNumber}</span>
-                        </li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="toc-empty">문서에 개요 제목이 없습니다.</p>
-                  )}
+                          {entry.text}
+                        </button>
+                        <span className="toc-page">{entry.pageNumber}</span>
+                      </li>
+                    ))}
+                  </ul>
                 </nav>
               ) : (
                 <div className="thumbnail-panel">
-                  {renderedPages.map((page) => (
-                    <button
-                      key={page.key}
-                      className="thumbnail-item"
-                      type="button"
-                      onClick={() => scrollToPage(page.displayPageNumber)}
-                    >
-                      <span className="thumbnail-label">쪽 {page.displayPageNumber}</span>
-                    </button>
-                  ))}
+                  {pdfDocumentActive
+                    ? pdfPageMetrics.map((page) => (
+                        <button
+                          key={`pdf-thumb-${page.pageNumber}`}
+                          className="thumbnail-item"
+                          type="button"
+                          onClick={() => scrollToPage(page.pageNumber)}
+                        >
+                          <span className="thumbnail-label">쪽 {page.pageNumber}</span>
+                        </button>
+                      ))
+                    : renderedPages.map((page) => (
+                        <button
+                          key={page.key}
+                          className="thumbnail-item"
+                          type="button"
+                          onClick={() => scrollToPage(page.displayPageNumber)}
+                        >
+                          <span className="thumbnail-label">쪽 {page.displayPageNumber}</span>
+                        </button>
+                      ))}
                 </div>
               )}
             </aside>
@@ -3358,157 +5689,244 @@ function App() {
             </div>
           ) : null}
 
-          <div className="measure-layer" aria-hidden="true">
-            {activeDocument.document.sections.map((section) => {
-              const zoomFactor = resolveZoomFactor(section.pageLayout, zoomPreset, workspaceWidth)
-              const measureContext: PlaceholderContext = { pageNumber: 1, totalPages: totalPages || 1 }
-
-              return (
-                <div
-                  key={`measure-${section.id}`}
-                  ref={(element) => {
-                    measureRefs.current[section.id] = element
-                  }}
-                  className="paper-page paper-measure"
-                  style={pageMeasureStyle(section.pageLayout, zoomFactor)}
-                >
-                  {selectHeaderFooter(section.headers, 1) ? (
-                    <div data-region="header" className="page-region page-header">
-                      {selectHeaderFooter(section.headers, 1)?.blocks.map((block, index) =>
-                        renderBlock(
-                          block,
-                          `measure-header-${section.id}-${index}`,
-                          zoomFactor,
-                          measureContext,
-                          documentAssets,
-                        ),
-                      )}
-                    </div>
-                  ) : null}
-                  <div data-region="body" className="page-content">
-                    {section.blocks.map((block, index) => (
-                      <div
-                        key={`measure-block-${section.id}-${index}`}
-                        data-block-index={index}
-                        data-page-break-before={blockPageBreakBefore(block)}
-                        className="measure-block"
-                      >
-                        {renderBlock(
-                          block,
-                          `measure-body-${section.id}-${index}`,
-                          zoomFactor,
-                          measureContext,
-                          documentAssets,
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                  {selectHeaderFooter(section.footers, 1) ? (
-                    <div data-region="footer" className="page-region page-footer">
-                      {selectHeaderFooter(section.footers, 1)?.blocks.map((block, index) =>
-                        renderBlock(
-                          block,
-                          `measure-footer-${section.id}-${index}`,
-                          zoomFactor,
-                          measureContext,
-                          documentAssets,
-                        ),
-                      )}
-                    </div>
-                  ) : null}
-                </div>
-              )
-            })}
-          </div>
-
-          <div ref={pageWorkspaceRef} className="page-workspace">
-            <div className="page-stack">
-              {renderedPages.map((page, pageIndex) => {
-                const zoomFactor = resolveZoomFactor(page.pageLayout, zoomPreset, workspaceWidth)
-                const context: PlaceholderContext = {
-                  pageNumber: page.displayPageNumber,
-                  totalPages,
-                }
-
-                return (
-                  <LazyPage
-                    key={page.key}
-                    className="paper-page"
-                    data-page-number={page.displayPageNumber}
-                    style={pageStyle(page.pageLayout, zoomFactor)}
-                    enabled={renderedPages.length > 10}
-                  >
-                    <div className="page-caption">쪽 {page.displayPageNumber}</div>
-                    {page.header ? (
-                      <div className="page-region page-header">
-                        {page.header.blocks.map((block, index) =>
-                          renderBlock(
-                            block,
-                            `page-header-${page.key}-${index}`,
-                            zoomFactor,
-                            context,
-                            documentAssets,
-                          ),
-                        )}
-                      </div>
-                    ) : null}
-                    <div className="page-content page-body">
-                      {page.blocks.length > 0 ? (
-                        (() => {
-                          const cw = pageContentWidth(page.pageLayout, zoomFactor)
-                          const exclusions = collectExclusionZones(page.blocks, cw, zoomFactor)
-                          let cumulativeHeight = 0
-                          return page.blocks.map((block, index) => {
-                            const estimatedHeight = block.type === 'paragraph'
-                              ? Math.round((hwpToPx(block.value.layoutHeightHint) ?? 24) * zoomFactor)
-                              : block.type === 'image' ? Math.round((hwpToPx(block.value.height) ?? 48) * zoomFactor)
-                              : 48
-                            const blockTop = cumulativeHeight
-                            const blockBottom = cumulativeHeight + estimatedHeight
-                            cumulativeHeight = blockBottom
-                            const insets = exclusions.length > 0
-                              ? calculateParagraphInsets(blockTop, blockBottom, exclusions, cw)
-                              : null
-                            const blockMatches: BlockSearchMatches = searchMatches
-                              .filter((m) => m.pageIndex === pageIndex && m.blockIndex === index)
-                              .map((m) => ({ runIndex: m.runIndex, start: m.start, length: m.length, matchGlobalIndex: searchMatches.indexOf(m) }))
-                            return renderBlock(
-                              block,
-                              `page-body-${page.key}-${index}`,
-                              zoomFactor,
-                              context,
-                              documentAssets,
-                              insets,
-                              blockMatches.length > 0 ? blockMatches : undefined,
-                              searchMatchIndex,
-                            )
-                          })
-                        })()
-                      ) : (
-                        <div className="document-empty">
-                          <strong>표시할 본문이 없습니다.</strong>
-                          <p>{activeDocument.plainText || '문서에서 표시 가능한 텍스트를 찾지 못했습니다.'}</p>
-                        </div>
-                      )}
-                    </div>
-                    {page.footer ? (
-                      <div className="page-region page-footer">
-                        {page.footer.blocks.map((block, index) =>
-                          renderBlock(
-                            block,
-                            `page-footer-${page.key}-${index}`,
-                            zoomFactor,
-                            context,
-                            documentAssets,
-                          ),
-                        )}
-                      </div>
-                    ) : null}
-                  </LazyPage>
-                )
-              })}
+          {markdownEditable && documentMode === 'edit' ? (
+            <div className="markdown-editor-stage">
+              <div className="markdown-editor-toolbar">
+                <strong>Markdown 편집기</strong>
+                <span className="markdown-editor-hint">편집 중인 내용은 자동으로 뷰어 모드 미리보기에 반영됩니다.</span>
+              </div>
+              <textarea
+                className="markdown-editor"
+                value={markdownSource}
+                onChange={(e) => setMarkdownSource(e.target.value)}
+                spellCheck={false}
+                placeholder="Markdown 내용을 입력하세요"
+              />
             </div>
-          </div>
+          ) : pdfDocumentActive ? (
+            <>
+              {pdfLoadError ? (
+                <p className="error-banner">{pdfLoadError}</p>
+              ) : null}
+              <div ref={pageWorkspaceRef} className="page-workspace">
+                <div ref={pageStackRef} className="page-stack" style={pageStackStyle(pageColumns)}>
+                  {pdfDocumentProxy && pdfPageMetrics.length > 0 ? (
+                    pdfPageMetrics.map((page) => {
+                      const zoomFactor = resolvePdfZoomFactor(
+                        page,
+                        zoomMode,
+                        zoomPercent,
+                        workspaceWidth,
+                        workspaceViewportHeight,
+                        pageColumns,
+                        fitViewportCorrection,
+                      )
+                      const shouldMaterialize = pdfMaterializedPageNumbers.has(page.pageNumber)
+
+                      return (
+                        <article
+                          key={`pdf-${page.pageNumber}`}
+                          className="paper-page pdf-paper-page"
+                          data-page-number={page.pageNumber}
+                          style={pdfPageStyle(page, zoomFactor)}
+                        >
+                          <div className="page-caption">쪽 {page.pageNumber}</div>
+                          {shouldMaterialize ? (
+                            <PdfPageView
+                              pdfDocument={pdfDocumentProxy}
+                              pageNumber={page.pageNumber}
+                              zoomFactor={zoomFactor}
+                              searchMatches={pdfSearchMatchesByPageNumber.get(page.pageNumber) ?? []}
+                              activeSearchMatchIndex={searchMatchIndex}
+                            />
+                          ) : (
+                            <div className="pdf-page-placeholder" aria-hidden="true" />
+                          )}
+                        </article>
+                      )
+                    })
+                  ) : (
+                    <div className="document-empty">
+                      <strong>PDF를 준비 중입니다.</strong>
+                      <p>페이지를 렌더링하는 동안 잠시 기다려 주세요.</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="measure-layer" aria-hidden="true">
+                {activeDocument.document.sections.map((section) => {
+                  const paginationZoomFactor = 1
+                  const measureContext: PlaceholderContext = {
+                    pageNumber: 1,
+                    totalPages: totalPages || 1,
+                    format: activeDocument.diagnostics.format,
+                  }
+
+                  return (
+                    <div
+                      key={`measure-${section.id}`}
+                      ref={(element) => {
+                        measureRefs.current[section.id] = element
+                      }}
+                      className="paper-page paper-measure"
+                      style={pageMeasureStyle(section.pageLayout, paginationZoomFactor)}
+                    >
+                      {selectHeaderFooter(section.headers, 1) ? (
+                        <div data-region="header" className="page-region page-header">
+                          {selectHeaderFooter(section.headers, 1)?.blocks.map((block, index) =>
+                            renderBlock(
+                              block,
+                              `measure-header-${section.id}-${index}`,
+                              paginationZoomFactor,
+                              measureContext,
+                              documentAssets,
+                            ),
+                          )}
+                        </div>
+                      ) : null}
+                      <div data-region="body" className="page-content">
+                        {section.blocks.map((block, index) => (
+                          <div
+                            key={`measure-block-${section.id}-${index}`}
+                            data-block-index={index}
+                            data-page-break-before={blockPageBreakBefore(block)}
+                            className="measure-block"
+                          >
+                            {renderBlock(
+                              block,
+                              `measure-body-${section.id}-${index}`,
+                              paginationZoomFactor,
+                              measureContext,
+                              documentAssets,
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                      {selectHeaderFooter(section.footers, 1) ? (
+                        <div data-region="footer" className="page-region page-footer">
+                          {selectHeaderFooter(section.footers, 1)?.blocks.map((block, index) =>
+                            renderBlock(
+                              block,
+                              `measure-footer-${section.id}-${index}`,
+                              paginationZoomFactor,
+                              measureContext,
+                              documentAssets,
+                            ),
+                          )}
+                        </div>
+                      ) : null}
+                    </div>
+                  )
+                })}
+              </div>
+
+              <div ref={pageWorkspaceRef} className="page-workspace">
+                <div ref={pageStackRef} className="page-stack" style={pageStackStyle(pageColumns)}>
+                  {renderedPages.map((page, pageIndex) => {
+                    const zoomFactor = resolveZoomFactor(
+                      page.pageLayout,
+                      zoomMode,
+                      zoomPercent,
+                      workspaceWidth,
+                      workspaceViewportHeight,
+                      pageColumns,
+                      fitViewportCorrection,
+                    )
+                    const context: PlaceholderContext = {
+                      pageNumber: page.displayPageNumber,
+                      totalPages,
+                      format: activeDocument.diagnostics.format,
+                    }
+
+                    return (
+                      <LazyPage
+                        key={page.key}
+                        className="paper-page"
+                        data-page-number={page.displayPageNumber}
+                        style={pageStyle(page.pageLayout, zoomFactor)}
+                        enabled={renderedPages.length > 10}
+                      >
+                        <div className="page-caption">쪽 {page.displayPageNumber}</div>
+                        {page.header ? (
+                          <div className="page-region page-header">
+                            {page.header.blocks.map((block, index) =>
+                              renderBlock(
+                                block,
+                                `page-header-${page.key}-${index}`,
+                                zoomFactor,
+                                context,
+                                documentAssets,
+                              ),
+                            )}
+                          </div>
+                        ) : null}
+                        <div className="page-content page-body">
+                          {page.blocks.length > 0 ? (
+                            (() => {
+                              const cw = pageContentWidth(page.pageLayout, zoomFactor)
+                              const exclusions = collectExclusionZones(page.blocks, cw, zoomFactor)
+                              let cumulativeHeight = 0
+                              return page.blocks.map((block, index) => {
+                                const estimatedHeight = block.type === 'paragraph'
+                                  ? Math.round((hwpToPx(block.value.layoutHeightHint) ?? 24) * zoomFactor)
+                                  : block.type === 'image' ? Math.round((hwpToPx(block.value.height) ?? 48) * zoomFactor)
+                                  : 48
+                                const blockTop = cumulativeHeight
+                                const blockBottom = cumulativeHeight + estimatedHeight
+                                cumulativeHeight = blockBottom
+                                const insets = exclusions.length > 0
+                                  ? calculateParagraphInsets(blockTop, blockBottom, exclusions, cw)
+                                  : null
+                                const blockMatches: BlockSearchMatches = searchMatches
+                                  .filter((m) => m.pageIndex === pageIndex && m.blockIndex === index)
+                                  .map((m) => ({
+                                    runIndex: m.runIndex ?? 0,
+                                    start: m.start,
+                                    length: m.length,
+                                    matchGlobalIndex: m.matchGlobalIndex,
+                                  }))
+                                return renderBlock(
+                                  block,
+                                  `page-body-${page.key}-${index}`,
+                                  zoomFactor,
+                                  context,
+                                  documentAssets,
+                                  insets,
+                                  blockMatches.length > 0 ? blockMatches : undefined,
+                                  searchMatchIndex,
+                                )
+                              })
+                            })()
+                          ) : (
+                            <div className="document-empty">
+                              <strong>표시할 본문이 없습니다.</strong>
+                              <p>{activeDocument.plainText || '문서에서 표시 가능한 텍스트를 찾지 못했습니다.'}</p>
+                            </div>
+                          )}
+                        </div>
+                        {page.footer ? (
+                          <div className="page-region page-footer">
+                            {page.footer.blocks.map((block, index) =>
+                              renderBlock(
+                                block,
+                                `page-footer-${page.key}-${index}`,
+                                zoomFactor,
+                                context,
+                                documentAssets,
+                              ),
+                            )}
+                          </div>
+                        ) : null}
+                      </LazyPage>
+                    )
+                  })}
+                </div>
+              </div>
+            </>
+          )}
         </section>
       ) : (
         <section className="empty-stage">
@@ -3516,7 +5934,7 @@ function App() {
             <p className="app-kicker">시작하기</p>
             <h2>문서를 열어 한컴 문서처럼 확인하세요</h2>
             <p>
-              `.hwp` 또는 `.hwpx` 파일을 열면 페이지 윤곽과 본문 내용을 이 화면에 바로 표시합니다.
+              `.hwp`, `.hwpx`, `.md`, 또는 `.pdf` 파일을 열면 페이지 윤곽과 본문 내용을 이 화면에 바로 표시합니다.
             </p>
             <div className="empty-actions">
               <button
@@ -3527,7 +5945,7 @@ function App() {
               >
                 {opening ? '파일 여는 중...' : '파일 열기'}
               </button>
-              <span className="empty-hint">지원 형식: .hwp, .hwpx — 파일을 끌어다 놓을 수도 있습니다</span>
+              <span className="empty-hint">지원 형식: .hwp, .hwpx, .md, .pdf — 파일을 끌어다 놓을 수도 있습니다</span>
             </div>
             {recentFiles.length > 0 ? (
               <div className="recent-files">
@@ -3535,8 +5953,16 @@ function App() {
                 <ul className="recent-list">
                   {recentFiles.map((file, i) => (
                     <li key={i} className="recent-item">
-                      <span className="recent-name">{file.name}</span>
-                      <span className="recent-date">{new Date(file.openedAt).toLocaleDateString()}</span>
+                      <button
+                        type="button"
+                        className="recent-open-button"
+                        onClick={() => void handleRecentOpen(file)}
+                        disabled={opening}
+                        title={file.path}
+                      >
+                        <span className="recent-name">{file.name}</span>
+                        <span className="recent-date">{new Date(file.openedAt).toLocaleDateString()}</span>
+                      </button>
                     </li>
                   ))}
                 </ul>

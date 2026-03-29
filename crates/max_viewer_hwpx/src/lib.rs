@@ -742,6 +742,7 @@ fn parse_border_fill_definition(node: Node<'_, '_>) -> TableCellStyle {
 
     TableCellStyle {
         background_color: fill_color,
+        background_image: None,
         border_left: node
             .children()
             .find(|child| child.is_element() && child.tag_name().name() == "leftBorder")
@@ -813,7 +814,15 @@ fn parse_section_document(
     let root = document.root_element();
     let mut state = SectionParseState::default();
     let mut blocks = Vec::new();
-    collect_blocks(root, style_resolver, asset_lookup, &mut state, &mut blocks);
+    let mut pending_page_break_before = false;
+    collect_blocks(
+        root,
+        style_resolver,
+        asset_lookup,
+        &mut state,
+        &mut pending_page_break_before,
+        &mut blocks,
+    );
 
     Ok(Section {
         id: section_id,
@@ -830,57 +839,128 @@ fn collect_blocks(
     style_resolver: &HwpxStyleResolver,
     asset_lookup: &BTreeMap<String, String>,
     state: &mut SectionParseState,
+    pending_page_break_before: &mut bool,
     blocks: &mut Vec<Block>,
 ) {
     for child in node.children().filter(|node| node.is_element()) {
         match child.tag_name().name() {
             "p" => {
-                let embedded_blocks = collect_embedded_blocks_from_paragraph(
+                let mut embedded_blocks = collect_embedded_blocks_from_paragraph(
                     child,
                     style_resolver,
                     asset_lookup,
                     state,
                 );
-                if let Some(paragraph) = parse_paragraph(child, style_resolver, state) {
-                    let suppress_paragraph = !embedded_blocks.is_empty()
-                        && !paragraph_has_visible_text(&paragraph)
-                        && paragraph.marker.is_none()
-                        && !paragraph.page_break_before;
-                    if !suppress_paragraph {
+                if let Some(mut paragraph) = parse_paragraph(child, style_resolver, state) {
+                    let paragraph_is_empty =
+                        !paragraph_has_visible_text(&paragraph) && paragraph.marker.is_none();
+                    let paragraph_is_wrapper = paragraph_is_empty && !embedded_blocks.is_empty();
+
+                    if paragraph_is_wrapper {
+                        if paragraph.page_break_before || *pending_page_break_before {
+                            apply_page_break_before_to_first_block(
+                                &mut embedded_blocks,
+                                pending_page_break_before,
+                            );
+                        }
+                    } else if paragraph_is_empty {
+                        if paragraph.page_break_before {
+                            *pending_page_break_before = true;
+                        } else if !*pending_page_break_before {
+                            blocks.push(Block::Paragraph(paragraph));
+                        }
+                    } else {
+                        if *pending_page_break_before {
+                            paragraph.page_break_before = true;
+                            *pending_page_break_before = false;
+                        }
                         blocks.push(Block::Paragraph(paragraph));
                     }
                 }
                 for embedded_block in embedded_blocks {
-                    blocks.push(embedded_block);
+                    push_block_with_pending(blocks, embedded_block, pending_page_break_before);
                 }
             }
             "tbl" => {
                 let table = parse_table(child, style_resolver, asset_lookup, state);
                 if !table.rows.is_empty() {
-                    blocks.push(Block::Table(table));
+                    push_block_with_pending(blocks, Block::Table(table), pending_page_break_before);
                 }
             }
             "pic" | "img" | "image" | "ole" | "rect" | "ellipse" | "line" | "connectLine"
             | "arc" | "curve" | "polygon" | "container" | "textart" | "equation" => {
                 if let Some(image) = parse_image(child, asset_lookup) {
-                    blocks.push(Block::Image(image));
+                    push_block_with_pending(blocks, Block::Image(image), pending_page_break_before);
                 }
             }
             "fn" | "endnote" => {
                 let kind = child.tag_name().name().to_string();
                 let mut fn_blocks = Vec::new();
-                collect_blocks(child, style_resolver, asset_lookup, state, &mut fn_blocks);
+                collect_blocks(
+                    child,
+                    style_resolver,
+                    asset_lookup,
+                    state,
+                    pending_page_break_before,
+                    &mut fn_blocks,
+                );
                 let number = state.footnote_counter;
                 state.footnote_counter += 1;
-                blocks.push(Block::Footnote(max_viewer_core::FootnoteBlock {
-                    kind,
-                    number: Some(number),
-                    blocks: fn_blocks,
-                }));
+                push_block_with_pending(
+                    blocks,
+                    Block::Footnote(max_viewer_core::FootnoteBlock {
+                        kind,
+                        number: Some(number),
+                        blocks: fn_blocks,
+                        page_break_before: false,
+                    }),
+                    pending_page_break_before,
+                );
             }
             "header" | "footer" => {}
-            _ => collect_blocks(child, style_resolver, asset_lookup, state, blocks),
+            _ => collect_blocks(
+                child,
+                style_resolver,
+                asset_lookup,
+                state,
+                pending_page_break_before,
+                blocks,
+            ),
         }
+    }
+}
+
+fn push_block_with_pending(
+    blocks: &mut Vec<Block>,
+    mut block: Block,
+    pending_page_break_before: &mut bool,
+) {
+    if *pending_page_break_before {
+        set_block_page_break_before(&mut block, true);
+        *pending_page_break_before = false;
+    }
+    blocks.push(block);
+}
+
+fn apply_page_break_before_to_first_block(
+    blocks: &mut [Block],
+    pending_page_break_before: &mut bool,
+) {
+    if let Some(first_block) = blocks.first_mut() {
+        set_block_page_break_before(first_block, true);
+        *pending_page_break_before = false;
+    } else {
+        *pending_page_break_before = true;
+    }
+}
+
+fn set_block_page_break_before(block: &mut Block, value: bool) {
+    match block {
+        Block::Paragraph(paragraph) => paragraph.page_break_before = value,
+        Block::Table(table) => table.page_break_before = value,
+        Block::Image(image) => image.page_break_before = value,
+        Block::Footnote(footnote) => footnote.page_break_before = value,
+        Block::Unsupported(unsupported) => unsupported.page_break_before = value,
     }
 }
 
@@ -1357,11 +1437,13 @@ fn parse_header_footers(
 
             let mut state = SectionParseState::default();
             let mut blocks = Vec::new();
+            let mut pending_page_break_before = false;
             collect_blocks(
                 sub_list,
                 style_resolver,
                 &BTreeMap::new(),
                 &mut state,
+                &mut pending_page_break_before,
                 &mut blocks,
             );
 
@@ -1475,6 +1557,11 @@ fn parse_text_style(
                 .unwrap_or(true)
         })
         .unwrap_or(false);
+    let underline_color = node
+        .children()
+        .find(|child| child.is_element() && child.tag_name().name() == "underline")
+        .and_then(|underline| underline.attribute("color"))
+        .and_then(normalize_color_value);
 
     let ratio = node
         .children()
@@ -1498,6 +1585,7 @@ fn parse_text_style(
         font_size: parse_i32_attribute(node, "height"),
         text_color: node.attribute("textColor").and_then(normalize_color_value),
         background_color: node.attribute("shadeColor").and_then(normalize_color_value),
+        underline_color,
         width_ratio: ratio,
         letter_spacing: spacing,
         relative_size,
@@ -1651,6 +1739,7 @@ fn parse_table(
         no_adjust: parse_bool_attribute(node, "noAdjust"),
         repeat_header,
         header_row_count,
+        page_break_before: false,
     }
 }
 
@@ -1704,13 +1793,28 @@ fn parse_cell(
     state: &mut SectionParseState,
 ) -> TableCell {
     let mut blocks = Vec::new();
+    let mut pending_page_break_before = false;
     if let Some(sub_list) = node
         .children()
         .find(|child| child.is_element() && child.tag_name().name() == "subList")
     {
-        collect_blocks(sub_list, style_resolver, asset_lookup, state, &mut blocks);
+        collect_blocks(
+            sub_list,
+            style_resolver,
+            asset_lookup,
+            state,
+            &mut pending_page_break_before,
+            &mut blocks,
+        );
     } else {
-        collect_blocks(node, style_resolver, asset_lookup, state, &mut blocks);
+        collect_blocks(
+            node,
+            style_resolver,
+            asset_lookup,
+            state,
+            &mut pending_page_break_before,
+            &mut blocks,
+        );
     }
 
     let cell_span = node
@@ -1794,6 +1898,7 @@ fn parse_image(node: Node<'_, '_>, asset_lookup: &BTreeMap<String, String>) -> O
         distance_bottom: out_margin_node.and_then(|n| parse_i32_attribute(n, "bottom")),
         rotation: parse_i32_attribute(node, "rotation"),
         caption,
+        page_break_before: false,
     })
 }
 
@@ -2587,6 +2692,37 @@ mod tests {
             parsed.document.sections[0].blocks[0],
             Block::Table(_)
         ));
+    }
+
+    #[test]
+    fn transfers_page_break_from_empty_paragraph_to_following_table() {
+        let bytes = fixture_hwpx_bytes_with_section(
+            "application/hwpx+zip",
+            br#"<hp:section xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+<hp:p paraPrIDRef="20" pageBreak="1">
+  <hp:run charPrIDRef="7"><hp:t> </hp:t></hp:run>
+</hp:p>
+<hp:tbl rowCnt="1" colCnt="1" cellSpacing="0">
+  <hp:tr>
+    <hp:tc>
+      <hp:subList><hp:p><hp:run><hp:t>Cell</hp:t></hp:run></hp:p></hp:subList>
+      <hp:cellSpan colSpan="1" rowSpan="1" />
+      <hp:cellSz width="12000" height="3600" />
+    </hp:tc>
+  </hp:tr>
+</hp:tbl>
+</hp:section>"#,
+        );
+
+        let parsed = HwpxInspector
+            .parse_bytes(&bytes, Some("fixture.hwpx"))
+            .expect("fixture should parse");
+
+        assert_eq!(parsed.document.sections[0].blocks.len(), 1);
+        match &parsed.document.sections[0].blocks[0] {
+            Block::Table(table) => assert!(table.page_break_before),
+            _ => panic!("expected table block"),
+        }
     }
 
     #[test]

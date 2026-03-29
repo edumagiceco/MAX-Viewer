@@ -10,7 +10,7 @@
     "frontendDist": "../../../packages/viewer-ui/dist"
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "icon": [
       "icons/icon.icns",
       "icons/icon.ico",

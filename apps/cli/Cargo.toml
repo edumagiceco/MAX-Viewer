@@ -13,5 +13,7 @@ path = "src/main.rs"
 max_viewer_core.workspace = true
 max_viewer_hwpx.workspace = true
 max_viewer_hwp.workspace = true
+max_viewer_markdown.workspace = true
+max_viewer_pdf.workspace = true
 max_viewer_export.workspace = true
 serde_json.workspace = true

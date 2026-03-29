@@ -3,6 +3,8 @@ members = [
   "crates/max_viewer_core",
   "crates/max_viewer_hwpx",
   "crates/max_viewer_hwp",
+  "crates/max_viewer_pdf",
+  "crates/max_viewer_markdown",
   "crates/max_viewer_layout",
   "crates/max_viewer_export",
   "apps/desktop-tauri/src-tauri",
@@ -24,8 +26,12 @@ flate2 = "1"
 max_viewer_core = { path = "crates/max_viewer_core" }
 max_viewer_hwpx = { path = "crates/max_viewer_hwpx" }
 max_viewer_hwp = { path = "crates/max_viewer_hwp" }
+max_viewer_pdf = { path = "crates/max_viewer_pdf" }
+max_viewer_markdown = { path = "crates/max_viewer_markdown" }
 max_viewer_layout = { path = "crates/max_viewer_layout" }
 max_viewer_export = { path = "crates/max_viewer_export" }
+lopdf = "0.38"
+pulldown-cmark = "0.13.0"
 roxmltree = "0.20"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }

@@ -1,4 +1,5 @@
 use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::path::Path;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use cfb::CompoundFile;
@@ -26,11 +27,16 @@ const HWPTAG_STYLE: u16 = HWPTAG_BEGIN + 10;
 const HWPTAG_PARA_HEADER: u16 = HWPTAG_BEGIN + 50;
 const HWPTAG_PARA_TEXT: u16 = HWPTAG_BEGIN + 51;
 const HWPTAG_PARA_CHAR_SHAPE: u16 = HWPTAG_BEGIN + 52;
-const HWPTAG_CTRL_HEADER: u16 = HWPTAG_BEGIN + 54;
-const HWPTAG_LIST_HEADER: u16 = HWPTAG_BEGIN + 55;
-const HWPTAG_PAGE_DEF: u16 = HWPTAG_BEGIN + 56;
-const HWPTAG_TABLE: u16 = HWPTAG_BEGIN + 59;
+const HWPTAG_PARA_LINE_SEG: u16 = HWPTAG_BEGIN + 53;
+const HWPTAG_PARA_RANGE_TAG: u16 = HWPTAG_BEGIN + 54;
+const HWPTAG_CTRL_HEADER: u16 = HWPTAG_BEGIN + 55;
+const HWPTAG_LIST_HEADER: u16 = HWPTAG_BEGIN + 56;
+const HWPTAG_PAGE_DEF: u16 = HWPTAG_BEGIN + 57;
+const HWPTAG_FOOTNOTE_SHAPE: u16 = HWPTAG_BEGIN + 58;
+const HWPTAG_PAGE_BORDER_FILL: u16 = HWPTAG_BEGIN + 59;
 const HWPTAG_SHAPE_COMPONENT: u16 = HWPTAG_BEGIN + 60;
+const HWPTAG_TABLE: u16 = HWPTAG_BEGIN + 61;
+const HWPTAG_SHAPE_COMPONENT_PICTURE: u16 = HWPTAG_BEGIN + 69;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -50,6 +56,14 @@ struct HwpHeader {
 
 #[derive(Debug, Default)]
 pub struct HwpInspector;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct HwpLineSegment {
+    chpos: i32,
+    y: i32,
+    height: i32,
+    space_below: i32,
+}
 
 // ---------------------------------------------------------------------------
 // Record iterator
@@ -112,6 +126,7 @@ struct CharShape {
     height: u32,
     attributes: u32,
     text_color: u32,
+    underline_color: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -147,6 +162,7 @@ struct HwpBorderFill {
     border_top: Option<TableBorder>,
     border_bottom: Option<TableBorder>,
     background_color: Option<String>,
+    background_image: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -245,6 +261,7 @@ fn parse_char_shape(data: &[u8]) -> CharShape {
     cs.attributes = u32::from_le_bytes(data[46..50].try_into().unwrap_or([0; 4]));
     // shadow_gap1(1) shadow_gap2(1) -> 50..52
     cs.text_color = u32::from_le_bytes(data[52..56].try_into().unwrap_or([0; 4]));
+    cs.underline_color = u32::from_le_bytes(data[56..60].try_into().unwrap_or([0; 4]));
     cs
 }
 
@@ -309,51 +326,94 @@ fn parse_style(data: &[u8]) -> Option<HwpStyle> {
 
 fn parse_border_fill(data: &[u8]) -> HwpBorderFill {
     let mut bf = HwpBorderFill::default();
-    // HWP BORDER_FILL record: attributes(2) + border sides(each: type(1) + width(1) + color(4)) × 4 + diagonal...
-    // Simplified: read 4 border sides starting at offset 2
     if data.len() < 26 {
         return bf;
     }
     let read_border = |offset: usize| -> Option<TableBorder> {
-        if offset + 6 > data.len() {
-            return None;
-        }
-        let border_type = data[offset];
-        let border_width = data[offset + 1];
-        let color = u32::from_le_bytes(data[offset + 2..offset + 6].try_into().unwrap_or([0; 4]));
-        if border_type == 0 && border_width == 0 {
-            return None;
-        }
+        let border_type = data.get(offset)? & 0x0f;
+        let border_width = data.get(offset + 1)? & 0x0f;
+        let color = u32::from_le_bytes(data[offset + 2..offset + 6].try_into().ok()?);
+
         let style_name = match border_type {
             0 => "NONE",
             1 => "SOLID",
-            2 => "DASHED",
-            3 => "DOTTED",
+            2 => "DASH",
+            3 => "DOT",
             4 => "DASH_DOT",
+            5 => "DASH_DOT_DOT",
+            6 => "LONG_DASH",
+            7 => "DOT",
+            8 => "DOUBLE",
+            9 => "DOUBLE_SLIM",
+            10 => "SLIM_THICK",
+            11 => "THICK_SLIM",
+            12 => "SOLID",
+            13 => "DOUBLE",
+            14 => "INSET",
+            15 => "OUTSET",
+            16 => "GROOVE",
+            17 => "RIDGE",
             _ => "SOLID",
         };
-        let width_mm = format!("{:.2} mm", border_width as f64 * 0.1);
+        let width_mm = match border_width {
+            0 => 0.10,
+            1 => 0.12,
+            2 => 0.15,
+            3 => 0.20,
+            4 => 0.25,
+            5 => 0.30,
+            6 => 0.40,
+            7 => 0.50,
+            8 => 0.60,
+            9 => 0.70,
+            10 => 1.00,
+            11 => 1.50,
+            12 => 2.00,
+            13 => 3.00,
+            14 => 4.00,
+            15 => 5.00,
+            _ => 0.10,
+        };
+
         Some(TableBorder {
             style: Some(style_name.to_string()),
-            width: Some(width_mm),
+            width: Some(format!("{width_mm:.2} mm")),
             color: Some(colorref_to_hex(color)),
         })
     };
+    // NOTE:
+    // HWP 5.0 BORDER_FILL is serialized as:
+    //   attribute(u16)
+    //   left/right/top/bottom Border(6 bytes each)
+    //   diagonal Border(6 bytes)
+    //   Fill
+    // Some public references list separate border type/width/color arrays, but
+    // actual HWP files and the reference parser on docs.rs read repeated border
+    // structs. Using array-style offsets misreads diagonal/fill bytes as colors
+    // and turns decorative cover tables into black/gray boxes.
     bf.border_left = read_border(2);
     bf.border_right = read_border(8);
     bf.border_top = read_border(14);
     bf.border_bottom = read_border(20);
-    // Fill info comes after borders — try to read background color
-    // The fill section is variable-length; look for a COLORREF at the tail
-    if data.len() >= 30 {
-        let fill_offset = 26;
-        if fill_offset + 4 <= data.len() {
-            let fill_color = u32::from_le_bytes(
-                data[fill_offset..fill_offset + 4].try_into().unwrap_or([0; 4]),
-            );
-            if fill_color != 0 && fill_color != 0x00FFFFFF {
-                bf.background_color = Some(colorref_to_hex(fill_color));
+    let fill_offset = 32;
+    if data.len() >= fill_offset + 4 {
+        let fill_type = u32::from_le_bytes(
+            data[fill_offset..fill_offset + 4]
+                .try_into()
+                .unwrap_or([0; 4]),
+        );
+        if fill_type & 0x0000_0001 != 0 {
+            if data.len() >= fill_offset + 8 {
+                let background_color = u32::from_le_bytes(
+                    data[fill_offset + 4..fill_offset + 8]
+                        .try_into()
+                        .unwrap_or([0; 4]),
+                );
+                bf.background_color = Some(colorref_to_hex(background_color));
             }
+        }
+        if fill_type & 0x0000_0004 != 0 {
+            bf.background_image = parse_gradation_fill_css(&data[fill_offset + 4..]);
         }
     }
     bf
@@ -362,12 +422,23 @@ fn parse_border_fill(data: &[u8]) -> HwpBorderFill {
 fn border_fill_to_cell_style(bf: &HwpBorderFill) -> TableCellStyle {
     TableCellStyle {
         background_color: bf.background_color.clone(),
+        background_image: bf.background_image.clone(),
         border_left: bf.border_left.clone(),
         border_right: bf.border_right.clone(),
         border_top: bf.border_top.clone(),
         border_bottom: bf.border_bottom.clone(),
         diagonal: None,
     }
+}
+
+fn resolve_border_fill_style(
+    doc_info: &DocInfoStore,
+    border_fill_id: Option<u16>,
+) -> Option<TableCellStyle> {
+    border_fill_id
+        .and_then(|id| id.checked_sub(1))
+        .and_then(|index| doc_info.border_fills.get(index as usize))
+        .map(border_fill_to_cell_style)
 }
 
 fn parse_bin_data_ref(data: &[u8]) -> BinDataRef {
@@ -426,14 +497,16 @@ fn load_bin_data_assets(
         let ext = bin_data_refs
             .get(index)
             .map(|b| b.extension.as_str())
-            .unwrap_or("");
+            .filter(|ext| !ext.is_empty())
+            .unwrap_or_else(|| {
+                Path::new(path)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("")
+            });
         let media_type = guess_media_type(ext, &bytes);
         let data_uri = format!("data:{};base64,{}", media_type, BASE64.encode(&bytes));
-        let id = path
-            .rsplit('/')
-            .next()
-            .unwrap_or(path)
-            .to_string();
+        let id = path.rsplit('/').next().unwrap_or(path).to_string();
 
         assets.push(AssetRef {
             id,
@@ -474,18 +547,28 @@ fn guess_media_type(ext: &str, bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 fn char_shape_to_text_style(cs: &CharShape, face_names: &[FaceName]) -> TextStyle {
+    let underline_kind = (cs.attributes >> 2) & 0x3;
+    let has_visible_underline = matches!(underline_kind, 1 | 3);
+
     TextStyle {
-        font_family: face_names.get(cs.face_name_ids[0] as usize).map(|f| f.name.clone()),
+        font_family: face_names
+            .get(cs.face_name_ids[0] as usize)
+            .map(|f| f.name.clone()),
         font_size: if cs.height > 0 {
-            Some(cs.height as i32 / 100)
+            Some(cs.height as i32)
         } else {
             None
         },
         bold: cs.attributes & (1 << 1) != 0,
         italic: cs.attributes & (1 << 0) != 0,
-        underline: (cs.attributes >> 2) & 0x3 != 0,
+        underline: has_visible_underline,
         text_color: if cs.text_color != 0 {
             Some(colorref_to_hex(cs.text_color))
+        } else {
+            None
+        },
+        underline_color: if has_visible_underline {
+            Some(colorref_to_hex(cs.underline_color))
         } else {
             None
         },
@@ -504,7 +587,7 @@ fn char_shape_to_text_style(cs: &CharShape, face_names: &[FaceName]) -> TextStyl
 }
 
 fn para_shape_to_paragraph_style(ps: &ParaShape) -> ParagraphStyle {
-    let align_bits = ps.attributes & 0x7;
+    let align_bits = (ps.attributes >> 2) & 0x7;
     let align = match align_bits {
         0 => Some("JUSTIFY".to_string()),
         1 => Some("LEFT".to_string()),
@@ -555,6 +638,58 @@ fn colorref_to_hex(c: u32) -> String {
     let g = (c >> 8) & 0xff;
     let b = (c >> 16) & 0xff;
     format!("#{:02x}{:02x}{:02x}", r, g, b)
+}
+
+fn read_u8(cursor: &mut Cursor<&[u8]>) -> Option<u8> {
+    let mut buf = [0u8; 1];
+    cursor.read_exact(&mut buf).ok()?;
+    Some(buf[0])
+}
+
+fn read_i32(cursor: &mut Cursor<&[u8]>) -> Option<i32> {
+    let mut buf = [0u8; 4];
+    cursor.read_exact(&mut buf).ok()?;
+    Some(i32::from_le_bytes(buf))
+}
+
+fn read_u32(cursor: &mut Cursor<&[u8]>) -> Option<u32> {
+    let mut buf = [0u8; 4];
+    cursor.read_exact(&mut buf).ok()?;
+    Some(u32::from_le_bytes(buf))
+}
+
+fn parse_gradation_fill_css(data: &[u8]) -> Option<String> {
+    let mut cursor = Cursor::new(data);
+    let gradation_type = read_u8(&mut cursor)?;
+    let angle = read_i32(&mut cursor)?;
+    let _center_x = read_i32(&mut cursor)?;
+    let _center_y = read_i32(&mut cursor)?;
+    let _step = read_i32(&mut cursor)?;
+    let color_count = usize::try_from(read_i32(&mut cursor)?).ok()?;
+    if color_count < 2 {
+        return None;
+    }
+
+    for _ in 0..color_count.saturating_sub(2) {
+        read_i32(&mut cursor)?;
+    }
+
+    let mut colors = Vec::with_capacity(color_count);
+    for _ in 0..color_count {
+        colors.push(colorref_to_hex(read_u32(&mut cursor)?));
+    }
+
+    let _shape_type = read_u32(&mut cursor)?;
+    let _blur_center = read_u8(&mut cursor)?;
+
+    let stops = colors.join(", ");
+    let css_angle = if angle == 0 { 90 } else { angle };
+
+    match gradation_type {
+        1 => Some(format!("linear-gradient({css_angle}deg, {stops})")),
+        2 | 3 | 4 => Some(format!("linear-gradient(90deg, {stops})")),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +759,7 @@ fn parse_records_to_blocks(
                             blocks.push(Block::Unsupported(UnsupportedBlock {
                                 kind: "hwp-gso".to_string(),
                                 reason: Some("drawing object".to_string()),
+                                page_break_before: false,
                             }));
                         }
                         idx += consumed.max(1);
@@ -636,13 +772,15 @@ fn parse_records_to_blocks(
                     }
                     Some("daeh") => {
                         // Header control
-                        let (hf_blocks, consumed) = parse_header_footer_control(&records[idx..], doc_info, assets);
+                        let (hf_blocks, consumed) =
+                            parse_header_footer_control(&records[idx..], doc_info, assets);
                         header_blocks = hf_blocks;
                         idx += consumed.max(1);
                     }
                     Some("toof") => {
                         // Footer control
-                        let (hf_blocks, consumed) = parse_header_footer_control(&records[idx..], doc_info, assets);
+                        let (hf_blocks, consumed) =
+                            parse_header_footer_control(&records[idx..], doc_info, assets);
                         footer_blocks = hf_blocks;
                         idx += consumed.max(1);
                     }
@@ -666,15 +804,19 @@ fn parse_records_to_blocks(
         blocks.push(Block::Unsupported(UnsupportedBlock {
             kind: "__header_blocks__".to_string(),
             reason: Some(format!("{}", header_blocks.len())),
+            page_break_before: false,
         }));
         blocks.extend(header_blocks.into_iter().map(|b| {
             // Wrap in a sentinel-tagged unsupported to mark as header content
             Block::Unsupported(UnsupportedBlock {
                 kind: "__header_content__".to_string(),
                 reason: match &b {
-                    Block::Paragraph(p) => Some(p.runs.iter().map(|r| r.text.as_str()).collect::<String>()),
+                    Block::Paragraph(p) => {
+                        Some(p.runs.iter().map(|r| r.text.as_str()).collect::<String>())
+                    }
                     _ => Some("block".to_string()),
                 },
+                page_break_before: false,
             })
         }));
     }
@@ -682,14 +824,18 @@ fn parse_records_to_blocks(
         blocks.push(Block::Unsupported(UnsupportedBlock {
             kind: "__footer_blocks__".to_string(),
             reason: Some(format!("{}", footer_blocks.len())),
+            page_break_before: false,
         }));
         blocks.extend(footer_blocks.into_iter().map(|b| {
             Block::Unsupported(UnsupportedBlock {
                 kind: "__footer_content__".to_string(),
                 reason: match &b {
-                    Block::Paragraph(p) => Some(p.runs.iter().map(|r| r.text.as_str()).collect::<String>()),
+                    Block::Paragraph(p) => {
+                        Some(p.runs.iter().map(|r| r.text.as_str()).collect::<String>())
+                    }
                     _ => Some("block".to_string()),
                 },
+                page_break_before: false,
             })
         }));
     }
@@ -698,6 +844,7 @@ fn parse_records_to_blocks(
         blocks.push(Block::Unsupported(UnsupportedBlock {
             kind: "__page_layout__".to_string(),
             reason: Some(serde_page_layout(&layout)),
+            page_break_before: false,
         }));
     }
 
@@ -766,10 +913,15 @@ fn parse_paragraph_with_style<'a>(
     } else {
         None
     };
-    let style_id = if data.len() >= 11 { Some(data[10]) } else { None };
+    let style_id = if data.len() >= 11 {
+        Some(data[10])
+    } else {
+        None
+    };
 
     let mut text_data: Option<&[u8]> = None;
     let mut char_shape_positions: Vec<(u32, u32)> = Vec::new();
+    let mut line_segments: Vec<HwpLineSegment> = Vec::new();
     let mut consumed = 1;
 
     let base_level = header.level;
@@ -787,6 +939,9 @@ fn parse_paragraph_with_style<'a>(
             }
             HWPTAG_PARA_CHAR_SHAPE => {
                 char_shape_positions = parse_char_shape_positions(rec.data);
+            }
+            HWPTAG_PARA_LINE_SEG => {
+                line_segments = parse_para_line_segs(rec.data);
             }
             HWPTAG_CTRL_HEADER | HWPTAG_LIST_HEADER | HWPTAG_TABLE | HWPTAG_SHAPE_COMPONENT => {
                 // These belong to child controls — stop paragraph parsing
@@ -808,35 +963,143 @@ fn parse_paragraph_with_style<'a>(
     }
 
     // Build runs with char shape splits
-    let runs = build_styled_runs(&units, &char_shape_positions, doc_info);
+    let runs = apply_line_seg_breaks_to_runs(
+        build_styled_runs(&units, &char_shape_positions, doc_info),
+        &line_segments,
+    );
     if runs.is_empty() {
         return (None, consumed);
     }
 
     // Resolve paragraph style
     let para_style = resolve_para_style(para_shape_id, style_id, doc_info);
+    let line_segment_count = (!line_segments.is_empty()).then_some(line_segments.len() as u32);
+    let layout_height_hint = paragraph_layout_height_hint(&line_segments);
 
     (
         Some(Paragraph {
             marker: None,
             runs,
             style: para_style,
-            line_segment_count: None,
-            layout_height_hint: None,
+            line_segment_count,
+            layout_height_hint,
             page_break_before: false,
         }),
         consumed,
     )
 }
 
+fn parse_para_line_segs(data: &[u8]) -> Vec<HwpLineSegment> {
+    const LINE_SEG_SIZE: usize = 36;
+    if data.len() < LINE_SEG_SIZE {
+        return Vec::new();
+    }
+
+    data.chunks_exact(LINE_SEG_SIZE)
+        .map(|chunk| HwpLineSegment {
+            chpos: i32::from_le_bytes(chunk[0..4].try_into().unwrap_or([0; 4])),
+            y: i32::from_le_bytes(chunk[4..8].try_into().unwrap_or([0; 4])),
+            height: i32::from_le_bytes(chunk[8..12].try_into().unwrap_or([0; 4])),
+            space_below: i32::from_le_bytes(chunk[20..24].try_into().unwrap_or([0; 4])),
+        })
+        .collect()
+}
+
+fn paragraph_layout_height_hint(line_segments: &[HwpLineSegment]) -> Option<i32> {
+    line_segments
+        .iter()
+        .map(|seg| {
+            seg.y
+                .saturating_add(seg.height)
+                .saturating_add(seg.space_below)
+        })
+        .max()
+        .filter(|height| *height > 0)
+}
+
+fn apply_line_seg_breaks_to_runs(
+    runs: Vec<TextRun>,
+    line_segments: &[HwpLineSegment],
+) -> Vec<TextRun> {
+    let mut break_positions: Vec<usize> = line_segments
+        .iter()
+        .skip(1)
+        .filter_map(|seg| usize::try_from(seg.chpos).ok())
+        .collect();
+    break_positions.sort_unstable();
+    break_positions.dedup();
+    break_positions.retain(|pos| *pos > 0);
+
+    if break_positions.is_empty() {
+        return runs;
+    }
+
+    let mut output = Vec::with_capacity(runs.len() + break_positions.len());
+    let mut consumed_chars = 0usize;
+    let mut next_break_index = 0usize;
+
+    for run in runs {
+        let chars: Vec<char> = run.text.chars().collect();
+        if chars.is_empty() {
+            output.push(run);
+            continue;
+        }
+
+        let mut local_start = 0usize;
+        let run_end = consumed_chars + chars.len();
+
+        while let Some(&break_pos) = break_positions.get(next_break_index) {
+            if break_pos > run_end {
+                break;
+            }
+
+            let local_break = break_pos.saturating_sub(consumed_chars).min(chars.len());
+            if local_break > local_start {
+                output.push(TextRun {
+                    text: chars[local_start..local_break].iter().collect(),
+                    style: run.style.clone(),
+                });
+            }
+
+            output.push(TextRun {
+                text: "\n".to_string(),
+                style: None,
+            });
+            local_start = local_break;
+            next_break_index += 1;
+        }
+
+        if local_start < chars.len() {
+            output.push(TextRun {
+                text: chars[local_start..].iter().collect(),
+                style: run.style,
+            });
+        }
+
+        consumed_chars = run_end;
+    }
+
+    output
+}
+
 fn extract_text_units(data: &[u8], char_count: Option<u32>) -> Vec<u16> {
     if data.len() % 2 != 0 {
         return Vec::new();
     }
-    let mut units: Vec<u16> = data
+    let raw_units: Vec<u16> = data
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
         .collect();
+    let mut units = Vec::with_capacity(raw_units.len());
+    let mut index = 0usize;
+    while index < raw_units.len() {
+        if let Some(skip_len) = extended_control_span(&raw_units, index) {
+            index += skip_len;
+            continue;
+        }
+        units.push(raw_units[index]);
+        index += 1;
+    }
     if let Some(count) = char_count {
         let expected = count as usize;
         if expected > 0 && expected < units.len() {
@@ -844,6 +1107,30 @@ fn extract_text_units(data: &[u8], char_count: Option<u32>) -> Vec<u16> {
         }
     }
     units
+}
+
+fn extended_control_span(units: &[u16], index: usize) -> Option<usize> {
+    let Some(&control_char) = units.get(index) else {
+        return None;
+    };
+
+    if !(0x01..=0x1f).contains(&control_char) || matches!(control_char, 0x09 | 0x0a | 0x0d) {
+        return None;
+    }
+
+    // HWP PARA_TEXT stores inline control payloads inline with text as a short
+    // control marker + binary payload + matching tail marker sequence. The exact
+    // payload width varies across controls, so keep this parser-side and strip
+    // only the compact HWP control envelope instead of letting it leak into the UI.
+    for end in index + 1..usize::min(index + 8, units.len()) {
+        if units[end] == control_char {
+            return Some(end + 1 - index);
+        }
+    }
+
+    // If the control marker is malformed, still drop the lone control code so
+    // it cannot surface as mojibake in rendered text.
+    Some(1)
 }
 
 fn parse_char_shape_positions(data: &[u8]) -> Vec<(u32, u32)> {
@@ -868,7 +1155,10 @@ fn build_styled_runs(
         if text.trim().is_empty() {
             return Vec::new();
         }
-        let default_style = doc_info.char_shapes.first().map(|cs| char_shape_to_text_style(cs, &doc_info.face_names));
+        let default_style = doc_info
+            .char_shapes
+            .first()
+            .map(|cs| char_shape_to_text_style(cs, &doc_info.face_names));
         return vec![TextRun {
             text,
             style: default_style,
@@ -921,7 +1211,7 @@ fn units_to_text(units: &[u16]) -> String {
             }
         }
     }
-    text
+    normalize_hwp_text(text)
 }
 
 fn resolve_para_style(
@@ -981,57 +1271,101 @@ fn parse_table_control<'a>(
     if ctrl.tag_id != HWPTAG_CTRL_HEADER {
         return (None, 1);
     }
+    let object_width = ctrl
+        .data
+        .get(16..20)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])))
+        .filter(|value| *value > 0);
+    let object_height = ctrl
+        .data
+        .get(20..24)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])))
+        .filter(|value| *value > 0);
 
     let mut table_def: Option<(u16, u16, Option<u16>)> = None; // (row_count, col_count, border_fill_id)
     let mut cell_defs: Vec<CellDef> = Vec::new();
-    let mut consumed = 1;
-
     let base_level = ctrl.level;
-    for rec in records.iter().skip(1) {
+    let mut cursor = 1usize;
+
+    while cursor < records.len() {
+        let rec = &records[cursor];
         if rec.tag_id == HWPTAG_CTRL_HEADER && rec.level <= base_level {
             break;
         }
         if rec.tag_id == HWPTAG_PARA_HEADER && rec.level <= base_level {
             break;
         }
-        consumed += 1;
 
         match rec.tag_id {
             HWPTAG_TABLE => {
                 if rec.data.len() >= 8 {
-                    let row_count = u16::from_le_bytes(
-                        rec.data[4..6].try_into().unwrap_or([0; 2]),
-                    );
-                    let col_count = u16::from_le_bytes(
-                        rec.data[6..8].try_into().unwrap_or([0; 2]),
-                    );
+                    let row_count = u16::from_le_bytes(rec.data[4..6].try_into().unwrap_or([0; 2]));
+                    let col_count = u16::from_le_bytes(rec.data[6..8].try_into().unwrap_or([0; 2]));
                     let bf_id = if rec.data.len() >= 14 {
-                        Some(u16::from_le_bytes(rec.data[12..14].try_into().unwrap_or([0; 2])))
+                        Some(u16::from_le_bytes(
+                            rec.data[12..14].try_into().unwrap_or([0; 2]),
+                        ))
                     } else {
                         None
                     };
                     table_def = Some((row_count, col_count, bf_id));
                 }
+                cursor += 1;
             }
             HWPTAG_LIST_HEADER => {
                 let cell = parse_list_header_as_cell(rec.data);
                 // Collect paragraphs belonging to this cell
                 let cell_level = rec.level;
                 let mut cell_blocks = Vec::new();
-                while consumed < records.len() {
-                    let next = &records[consumed];
-                    if next.level <= cell_level {
+                cursor += 1;
+                while cursor < records.len() {
+                    let next = &records[cursor];
+                    if next.tag_id == HWPTAG_LIST_HEADER && next.level <= cell_level {
+                        break;
+                    }
+                    if next.tag_id == HWPTAG_CTRL_HEADER && next.level <= base_level {
+                        break;
+                    }
+                    if next.tag_id == HWPTAG_TABLE && next.level <= base_level {
                         break;
                     }
                     if next.tag_id == HWPTAG_PARA_HEADER {
                         let (para, pconsumed) =
-                            parse_paragraph_with_style(&records[consumed..], doc_info, assets);
+                            parse_paragraph_with_style(&records[cursor..], doc_info, assets);
                         if let Some(p) = para {
                             cell_blocks.push(Block::Paragraph(p));
                         }
-                        consumed += pconsumed;
+                        cursor += pconsumed.max(1);
+                    } else if next.tag_id == HWPTAG_CTRL_HEADER {
+                        match read_ctrl_type(next.data).as_deref() {
+                            Some("gso ") => {
+                                let (image, iconsumed) =
+                                    parse_gso_control(&records[cursor..], doc_info, assets);
+                                if let Some(img) = image {
+                                    cell_blocks.push(Block::Image(img));
+                                } else {
+                                    cell_blocks.push(Block::Unsupported(UnsupportedBlock {
+                                        kind: "hwp-gso".to_string(),
+                                        reason: Some("drawing object in table cell".to_string()),
+                                        page_break_before: false,
+                                    }));
+                                }
+                                cursor += iconsumed.max(1);
+                            }
+                            Some("tbl ") => {
+                                let (table, tconsumed) =
+                                    parse_table_control(&records[cursor..], doc_info, assets);
+                                if let Some(table) = table {
+                                    cell_blocks.push(Block::Table(table));
+                                }
+                                cursor += tconsumed.max(1);
+                            }
+                            _ => {
+                                cursor += 1;
+                            }
+                        }
                     } else {
-                        consumed += 1;
+                        cursor += 1;
                     }
                 }
                 cell_defs.push(CellDef {
@@ -1041,24 +1375,30 @@ fn parse_table_control<'a>(
                     row_span: cell.3,
                     width: cell.4,
                     height: cell.5,
+                    margin_left: cell.6,
+                    margin_right: cell.7,
+                    margin_top: cell.8,
+                    margin_bottom: cell.9,
+                    border_fill_id: cell.10.filter(|id| *id > 0),
                     blocks: cell_blocks,
                 });
             }
-            _ => {}
+            _ => {
+                cursor += 1;
+            }
         }
     }
 
     let (row_count, col_count, bf_id) = match table_def {
         Some(t) => t,
-        None => return (None, consumed),
+        None => return (None, cursor.max(1)),
     };
 
-    let table_style = bf_id
-        .and_then(|id| doc_info.border_fills.get(id as usize))
-        .map(border_fill_to_cell_style);
-    let mut table = assemble_table(row_count, col_count, cell_defs);
-    table.style = table_style;
-    (Some(table), consumed)
+    let mut table = assemble_table(row_count, col_count, cell_defs, doc_info);
+    table.width = object_width;
+    table.height = object_height;
+    table.style = resolve_border_fill_style(doc_info, bf_id);
+    (Some(table), cursor.max(1))
 }
 
 #[derive(Debug)]
@@ -1069,71 +1409,210 @@ struct CellDef {
     row_span: u16,
     width: u32,
     height: u32,
+    margin_left: u16,
+    margin_right: u16,
+    margin_top: u16,
+    margin_bottom: u16,
+    border_fill_id: Option<u16>,
     blocks: Vec<Block>,
 }
 
-fn parse_list_header_as_cell(data: &[u8]) -> (u16, u16, u16, u16, u32, u32) {
-    // para_count(2) + attributes(4) + ... cell info starts at offset 6
-    if data.len() < 22 {
-        return (0, 0, 1, 1, 0, 0);
+fn parse_list_header_as_cell(
+    data: &[u8],
+) -> (
+    u16,
+    u16,
+    u16,
+    u16,
+    u32,
+    u32,
+    u16,
+    u16,
+    u16,
+    u16,
+    Option<u16>,
+) {
+    // HWP 5.x table-cell LIST_HEADER stores a 4-byte paragraph count and a
+    // 4-byte attribute field before the 26-byte cell descriptor.
+    // Using the legacy 6-byte offset misreads widths/heights into huge or
+    // negative numbers and turns ordinary tables into page-sized black blocks.
+    const CELL_DESCRIPTOR_OFFSET: usize = 8;
+    if data.len() < CELL_DESCRIPTOR_OFFSET + 16 {
+        return (0, 0, 1, 1, 0, 0, 0, 0, 0, 0, None);
     }
-    let col_addr = u16::from_le_bytes(data[6..8].try_into().unwrap_or([0; 2]));
-    let row_addr = u16::from_le_bytes(data[8..10].try_into().unwrap_or([0; 2]));
-    let col_span = u16::from_le_bytes(data[10..12].try_into().unwrap_or([0; 2])).max(1);
-    let row_span = u16::from_le_bytes(data[12..14].try_into().unwrap_or([0; 2])).max(1);
-    let width = u32::from_le_bytes(data[14..18].try_into().unwrap_or([0; 4]));
-    let height = u32::from_le_bytes(data[18..22].try_into().unwrap_or([0; 4]));
-    (col_addr, row_addr, col_span, row_span, width, height)
+    let base = CELL_DESCRIPTOR_OFFSET;
+    let col_addr = u16::from_le_bytes(data[base..base + 2].try_into().unwrap_or([0; 2]));
+    let row_addr = u16::from_le_bytes(data[base + 2..base + 4].try_into().unwrap_or([0; 2]));
+    let col_span = u16::from_le_bytes(data[base + 4..base + 6].try_into().unwrap_or([0; 2])).max(1);
+    let row_span = u16::from_le_bytes(data[base + 6..base + 8].try_into().unwrap_or([0; 2])).max(1);
+    let width = u32::from_le_bytes(data[base + 8..base + 12].try_into().unwrap_or([0; 4]));
+    let height = u32::from_le_bytes(data[base + 12..base + 16].try_into().unwrap_or([0; 4]));
+    let margin_left = if data.len() >= base + 18 {
+        u16::from_le_bytes(data[base + 16..base + 18].try_into().unwrap_or([0; 2]))
+    } else {
+        0
+    };
+    let margin_right = if data.len() >= base + 20 {
+        u16::from_le_bytes(data[base + 18..base + 20].try_into().unwrap_or([0; 2]))
+    } else {
+        0
+    };
+    let margin_top = if data.len() >= base + 22 {
+        u16::from_le_bytes(data[base + 20..base + 22].try_into().unwrap_or([0; 2]))
+    } else {
+        0
+    };
+    let margin_bottom = if data.len() >= base + 24 {
+        u16::from_le_bytes(data[base + 22..base + 24].try_into().unwrap_or([0; 2]))
+    } else {
+        0
+    };
+    let border_fill_id = if data.len() >= base + 26 {
+        Some(u16::from_le_bytes(
+            data[base + 24..base + 26].try_into().unwrap_or([0; 2]),
+        ))
+    } else {
+        None
+    };
+    (
+        col_addr,
+        row_addr,
+        col_span,
+        row_span,
+        width,
+        height,
+        margin_left,
+        margin_right,
+        margin_top,
+        margin_bottom,
+        border_fill_id,
+    )
 }
 
-fn assemble_table(row_count: u16, _col_count: u16, cell_defs: Vec<CellDef>) -> TableBlock {
-    let mut rows: Vec<TableRow> = (0..row_count).map(|_| TableRow { cells: Vec::new() }).collect();
+fn assemble_table(
+    row_count: u16,
+    col_count: u16,
+    cell_defs: Vec<CellDef>,
+    doc_info: &DocInfoStore,
+) -> TableBlock {
+    let mut rows: Vec<TableRow> = (0..row_count)
+        .map(|_| TableRow { cells: Vec::new() })
+        .collect();
+    let total_cols = usize::from(col_count).max(
+        cell_defs
+            .iter()
+            .map(|cell| usize::from(cell.col_addr.saturating_add(cell.col_span.max(1))))
+            .max()
+            .unwrap_or(0),
+    );
+    let mut cells_by_row: Vec<Vec<CellDef>> = (0..row_count).map(|_| Vec::new()).collect();
 
     for cell in cell_defs {
-        let r = cell.row_addr as usize;
-        if r >= rows.len() {
-            continue;
+        let row_index = usize::from(cell.row_addr);
+        if row_index < cells_by_row.len() {
+            cells_by_row[row_index].push(cell);
         }
-        let text = cell
-            .blocks
-            .iter()
-            .filter_map(|b| match b {
-                Block::Paragraph(p) => Some(
-                    p.runs
-                        .iter()
-                        .map(|r| r.text.as_str())
-                        .collect::<String>(),
-                ),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+    }
 
-        rows[r].cells.push(TableCell {
-            text,
-            blocks: cell.blocks,
-            col_span: if cell.col_span > 1 {
-                Some(cell.col_span as u32)
-            } else {
-                None
-            },
-            row_span: if cell.row_span > 1 {
-                Some(cell.row_span as u32)
-            } else {
-                None
-            },
-            width: if cell.width > 0 {
-                Some(cell.width as i32)
-            } else {
-                None
-            },
-            height: if cell.height > 0 {
-                Some(cell.height as i32)
-            } else {
-                None
-            },
-            ..TableCell::default()
-        });
+    for row_cells in &mut cells_by_row {
+        row_cells.sort_by_key(|cell| (cell.col_addr, cell.col_span, cell.row_span));
+    }
+
+    let mut occupied = vec![vec![false; total_cols]; usize::from(row_count)];
+
+    for (r, row_cells) in cells_by_row.into_iter().enumerate() {
+        if r >= rows.len() {
+            break;
+        }
+        let mut current_col = 0usize;
+
+        for cell in row_cells {
+            let target_col = usize::from(cell.col_addr);
+            while current_col < target_col && current_col < total_cols {
+                if !occupied[r][current_col] {
+                    rows[r].cells.push(TableCell::default());
+                }
+                current_col += 1;
+            }
+            while current_col < total_cols && occupied[r][current_col] {
+                current_col += 1;
+            }
+
+            let placement_col = current_col.max(target_col.min(total_cols));
+            let col_span = usize::from(cell.col_span.max(1));
+            let row_span = usize::from(cell.row_span.max(1));
+            let text = cell
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::Paragraph(p) => {
+                        Some(p.runs.iter().map(|r| r.text.as_str()).collect::<String>())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            rows[r].cells.push(TableCell {
+                text,
+                blocks: cell.blocks,
+                col_span: if cell.col_span > 1 {
+                    Some(cell.col_span as u32)
+                } else {
+                    None
+                },
+                row_span: if cell.row_span > 1 {
+                    Some(cell.row_span as u32)
+                } else {
+                    None
+                },
+                width: if cell.width > 0 {
+                    Some(cell.width as i32)
+                } else {
+                    None
+                },
+                padding_left: if cell.margin_left > 0 {
+                    Some(cell.margin_left as i32)
+                } else {
+                    None
+                },
+                padding_right: if cell.margin_right > 0 {
+                    Some(cell.margin_right as i32)
+                } else {
+                    None
+                },
+                padding_top: if cell.margin_top > 0 {
+                    Some(cell.margin_top as i32)
+                } else {
+                    None
+                },
+                padding_bottom: if cell.margin_bottom > 0 {
+                    Some(cell.margin_bottom as i32)
+                } else {
+                    None
+                },
+                style: resolve_border_fill_style(doc_info, cell.border_fill_id),
+                // HWP cell heights are useful for small cover/layout tables, but some
+                // documents also contain page-sized bogus values. Keep only sane hints
+                // so title-page layout survives without reintroducing giant black blocks.
+                height: (cell.height > 0 && cell.height <= 20_000).then_some(cell.height as i32),
+                ..TableCell::default()
+            });
+
+            for future_row in r + 1..usize::min(rows.len(), r + row_span) {
+                for future_col in placement_col..usize::min(total_cols, placement_col + col_span) {
+                    occupied[future_row][future_col] = true;
+                }
+            }
+            current_col = placement_col.saturating_add(col_span);
+        }
+
+        while current_col < total_cols {
+            if !occupied[r][current_col] {
+                rows[r].cells.push(TableCell::default());
+            }
+            current_col += 1;
+        }
     }
 
     // Remove empty trailing rows
@@ -1141,10 +1620,93 @@ fn assemble_table(row_count: u16, _col_count: u16, cell_defs: Vec<CellDef>) -> T
         rows.pop();
     }
 
+    distribute_inline_images_across_empty_cells(&mut rows);
+
     TableBlock {
         rows,
         no_adjust: false,
+        page_break_before: false,
         ..TableBlock::default()
+    }
+}
+
+fn distribute_inline_images_across_empty_cells(rows: &mut [TableRow]) {
+    for row in rows {
+        if row.cells.len() < 2 {
+            continue;
+        }
+
+        let populated_indices: Vec<usize> = row
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| {
+                (!cell.blocks.is_empty() || !cell.text.trim().is_empty()).then_some(index)
+            })
+            .collect();
+        if populated_indices.len() != 1 {
+            continue;
+        }
+
+        let donor_index = populated_indices[0];
+        let donor = &row.cells[donor_index];
+        if donor.blocks.len() < 2 || !donor.blocks.iter().all(|block| matches!(block, Block::Image(_)))
+        {
+            continue;
+        }
+
+        let empty_indices: Vec<usize> = row
+            .cells
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| {
+                (index != donor_index && cell.blocks.is_empty() && cell.text.trim().is_empty())
+                    .then_some(index)
+            })
+            .collect();
+        if donor.blocks.len() > empty_indices.len() + 1 {
+            continue;
+        }
+
+        let donor_width = donor.width;
+        let donor_height = donor.height;
+        let donor_padding_left = donor.padding_left;
+        let donor_padding_right = donor.padding_right;
+        let donor_padding_top = donor.padding_top;
+        let donor_padding_bottom = donor.padding_bottom;
+        let donor_style = donor.style.clone();
+
+        let donor_blocks = std::mem::take(&mut row.cells[donor_index].blocks);
+        let Some(first_block) = donor_blocks.get(0).cloned() else {
+            continue;
+        };
+        row.cells[donor_index].blocks = vec![first_block];
+
+        for (target_index, block) in empty_indices.into_iter().zip(donor_blocks.into_iter().skip(1)) {
+            let target = &mut row.cells[target_index];
+            target.blocks = vec![block];
+            if target.width.is_none() {
+                target.width = donor_width;
+            }
+            if target.height.is_none() {
+                target.height = donor_height;
+            }
+            if target.padding_left.is_none() {
+                target.padding_left = donor_padding_left;
+            }
+            if target.padding_right.is_none() {
+                target.padding_right = donor_padding_right;
+            }
+            if target.padding_top.is_none() {
+                target.padding_top = donor_padding_top;
+            }
+            if target.padding_bottom.is_none() {
+                target.padding_bottom = donor_padding_bottom;
+            }
+            if target.style.is_none() {
+                target.style = donor_style.clone();
+            }
+        }
     }
 }
 
@@ -1174,6 +1736,28 @@ fn parse_header_footer_control<'a>(
                 hf_blocks.push(Block::Paragraph(p));
             }
             consumed += pconsumed;
+        } else if rec.tag_id == HWPTAG_CTRL_HEADER {
+            match read_ctrl_type(rec.data).as_deref() {
+                Some("gso ") => {
+                    let (image, iconsumed) =
+                        parse_gso_control(&records[consumed..], doc_info, assets);
+                    if let Some(img) = image {
+                        hf_blocks.push(Block::Image(img));
+                    }
+                    consumed += iconsumed.max(1);
+                }
+                Some("tbl ") => {
+                    let (table, tconsumed) =
+                        parse_table_control(&records[consumed..], doc_info, assets);
+                    if let Some(table) = table {
+                        hf_blocks.push(Block::Table(table));
+                    }
+                    consumed += tconsumed.max(1);
+                }
+                _ => {
+                    consumed += 1;
+                }
+            }
         } else {
             consumed += 1;
         }
@@ -1194,25 +1778,104 @@ fn parse_gso_control<'a>(
         return (None, 1);
     }
 
-    // Parse common object attributes from CTRL_HEADER
-    // offset 4..8: attributes
     let obj_attr = u32::from_le_bytes(ctrl.data[4..8].try_into().unwrap_or([0; 4]));
-    let treat_as_char = (obj_attr >> 18) & 1 != 0;
-
-    // offset 20..24: width, 24..28: height
-    let width = if ctrl.data.len() >= 24 {
-        Some(i32::from_le_bytes(
-            ctrl.data[20..24].try_into().unwrap_or([0; 4]),
-        ))
-    } else {
-        None
+    let treat_as_char = obj_attr & 1 != 0;
+    let vert_offset = ctrl
+        .data
+        .get(8..12)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])))
+        .filter(|value| *value != 0);
+    let horz_offset = ctrl
+        .data
+        .get(12..16)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])))
+        .filter(|value| *value != 0);
+    let width = ctrl
+        .data
+        .get(16..20)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])))
+        .filter(|value| *value > 0);
+    let height = ctrl
+        .data
+        .get(20..24)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])))
+        .filter(|value| *value > 0);
+    let z_order = ctrl
+        .data
+        .get(24..28)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])))
+        .filter(|value| *value != 0);
+    let distance_left = ctrl
+        .data
+        .get(28..30)
+        .map(|bytes| i16::from_le_bytes(bytes.try_into().unwrap_or([0; 2])) as i32)
+        .filter(|value| *value > 0);
+    let distance_right = ctrl
+        .data
+        .get(30..32)
+        .map(|bytes| i16::from_le_bytes(bytes.try_into().unwrap_or([0; 2])) as i32)
+        .filter(|value| *value > 0);
+    let distance_top = ctrl
+        .data
+        .get(32..34)
+        .map(|bytes| i16::from_le_bytes(bytes.try_into().unwrap_or([0; 2])) as i32)
+        .filter(|value| *value > 0);
+    let distance_bottom = ctrl
+        .data
+        .get(34..36)
+        .map(|bytes| i16::from_le_bytes(bytes.try_into().unwrap_or([0; 2])) as i32)
+        .filter(|value| *value > 0);
+    let vert_rel_to = match (obj_attr >> 3) & 0b11 {
+        0 => Some("PAPER".to_string()),
+        1 => Some("PAGE".to_string()),
+        2 => Some("PARA".to_string()),
+        _ => None,
     };
-    let height = if ctrl.data.len() >= 28 {
-        Some(i32::from_le_bytes(
-            ctrl.data[24..28].try_into().unwrap_or([0; 4]),
-        ))
-    } else {
-        None
+    let vert_align = match (obj_attr >> 5) & 0b111 {
+        0 => Some("TOP".to_string()),
+        1 => Some("CENTER".to_string()),
+        2 => Some("BOTTOM".to_string()),
+        3 => Some("INSIDE".to_string()),
+        4 => Some("OUTSIDE".to_string()),
+        _ => None,
+    };
+    let horz_rel_to = match (obj_attr >> 8) & 0b11 {
+        0 => Some("PAPER".to_string()),
+        1 => Some("PAGE".to_string()),
+        2 => Some("COLUMN".to_string()),
+        3 => Some("PARA".to_string()),
+        _ => None,
+    };
+    let horz_align = match (obj_attr >> 10) & 0b111 {
+        0 => Some("LEFT".to_string()),
+        1 => Some("CENTER".to_string()),
+        2 => Some("RIGHT".to_string()),
+        3 => Some("INSIDE".to_string()),
+        4 => Some("OUTSIDE".to_string()),
+        _ => None,
+    };
+    let width_rel_to = match (obj_attr >> 15) & 0b111 {
+        0 => Some("PAPER".to_string()),
+        1 => Some("PAGE".to_string()),
+        2 => Some("COLUMN".to_string()),
+        3 => Some("PARA".to_string()),
+        4 => Some("ABSOLUTE".to_string()),
+        _ => None,
+    };
+    let height_rel_to = match (obj_attr >> 18) & 0b11 {
+        0 => Some("PAPER".to_string()),
+        1 => Some("PAGE".to_string()),
+        2 => Some("ABSOLUTE".to_string()),
+        _ => None,
+    };
+    let text_wrap = match (obj_attr >> 21) & 0b111 {
+        0 => Some("SQUARE".to_string()),
+        1 => Some("TIGHT".to_string()),
+        2 => Some("THROUGH".to_string()),
+        3 => Some("TOP_AND_BOTTOM".to_string()),
+        4 => Some("BEHIND_TEXT".to_string()),
+        5 => Some("IN_FRONT_OF_TEXT".to_string()),
+        _ => None,
     };
 
     let base_level = ctrl.level;
@@ -1229,26 +1892,16 @@ fn parse_gso_control<'a>(
         }
         consumed += 1;
 
-        if rec.tag_id == HWPTAG_SHAPE_COMPONENT && rec.data.len() >= 4 {
-            // shape component: first 4 bytes = shape type id
-            // Look for $pic marker — if data contains a BinData reference
-            if rec.data.len() >= 8 {
-                // Search for BIN reference in shape data
-                // The BinDataID is typically after the shape type identification
-                // Try to find it by scanning for a plausible index
-                for offset in (4..rec.data.len().saturating_sub(1)).step_by(2) {
-                    if offset + 2 > rec.data.len() {
-                        break;
-                    }
-                    let candidate =
-                        u16::from_le_bytes(rec.data[offset..offset + 2].try_into().unwrap_or([0; 2]));
-                    // Check if this index maps to an existing asset
-                    if candidate > 0 && (candidate as usize) <= assets.len() {
-                        bin_item_id = Some(candidate);
-                        shape_type = "pic";
-                        break;
-                    }
-                }
+        if rec.tag_id == HWPTAG_SHAPE_COMPONENT_PICTURE && rec.data.len() >= 73 {
+            let candidate = u16::from_le_bytes(rec.data[71..73].try_into().unwrap_or([0; 2]));
+            if candidate > 0 && (candidate as usize) <= assets.len() {
+                bin_item_id = Some(candidate);
+                shape_type = "pic";
+            }
+        } else if rec.tag_id == HWPTAG_SHAPE_COMPONENT && rec.data.len() >= 4 {
+            let candidate_type = rec.data.get(0..4).map(read_ctrl_type_from_reversed);
+            if matches!(candidate_type.as_deref(), Some("$pic")) {
+                shape_type = "pic";
             }
         }
     }
@@ -1267,7 +1920,22 @@ fn parse_gso_control<'a>(
                 alt_text: None,
                 width,
                 height,
+                width_rel_to,
+                height_rel_to,
                 treat_as_char,
+                text_wrap,
+                z_order,
+                vert_rel_to,
+                horz_rel_to,
+                vert_align,
+                horz_align,
+                vert_offset,
+                horz_offset,
+                distance_left,
+                distance_right,
+                distance_top,
+                distance_bottom,
+                page_break_before: false,
                 ..ImageBlock::default()
             }),
             consumed,
@@ -1275,6 +1943,13 @@ fn parse_gso_control<'a>(
     }
 
     (None, consumed)
+}
+
+fn read_ctrl_type_from_reversed(bytes: &[u8]) -> String {
+    if bytes.len() < 4 {
+        return String::new();
+    }
+    String::from_utf8_lossy(&[bytes[3], bytes[2], bytes[1], bytes[0]]).to_string()
 }
 
 // --- Page definition (step 7) ---
@@ -1344,7 +2019,8 @@ impl HwpInspector {
             implemented: vec![
                 "CFB signature probing".to_string(),
                 "FileHeader version and attribute decoding".to_string(),
-                "DocInfo record decoding (FaceName, CharShape, ParaShape, Style, BinData)".to_string(),
+                "DocInfo record decoding (FaceName, CharShape, ParaShape, Style, BinData)"
+                    .to_string(),
                 "BodyText paragraph reconstruction with style application".to_string(),
                 "Table control parsing (CTRL_HEADER, TABLE, LIST_HEADER)".to_string(),
                 "Image/shape control parsing (gso, SHAPE_COMPONENT)".to_string(),
@@ -1486,12 +2162,15 @@ fn read_body_sections_with_docinfo(
         } else {
             vec![max_viewer_core::HeaderFooter {
                 apply_page_type: Some("BOTH".to_string()),
-                blocks: header_texts.into_iter().map(|text| {
-                    Block::Paragraph(Paragraph {
-                        runs: vec![TextRun { text, style: None }],
-                        ..Paragraph::default()
+                blocks: header_texts
+                    .into_iter()
+                    .map(|text| {
+                        Block::Paragraph(Paragraph {
+                            runs: vec![TextRun { text, style: None }],
+                            ..Paragraph::default()
+                        })
                     })
-                }).collect(),
+                    .collect(),
             }]
         };
         let footers = if footer_texts.is_empty() {
@@ -1499,12 +2178,15 @@ fn read_body_sections_with_docinfo(
         } else {
             vec![max_viewer_core::HeaderFooter {
                 apply_page_type: Some("BOTH".to_string()),
-                blocks: footer_texts.into_iter().map(|text| {
-                    Block::Paragraph(Paragraph {
-                        runs: vec![TextRun { text, style: None }],
-                        ..Paragraph::default()
+                blocks: footer_texts
+                    .into_iter()
+                    .map(|text| {
+                        Block::Paragraph(Paragraph {
+                            runs: vec![TextRun { text, style: None }],
+                            ..Paragraph::default()
+                        })
                     })
-                }).collect(),
+                    .collect(),
             }]
         };
 
@@ -1558,9 +2240,8 @@ impl FormatInspector for HwpInspector {
             .count();
         let has_preview = entry_paths.iter().any(|path| path == PREVIEW_TEXT_STREAM);
 
-        let mut notes = vec![
-            "Legacy HWP files are detected via the Compound File signature.".to_string(),
-        ];
+        let mut notes =
+            vec!["Legacy HWP files are detected via the Compound File signature.".to_string()];
 
         if has_preview {
             notes.push("PrvText preview stream is present.".to_string());
@@ -1704,6 +2385,7 @@ fn preview_blocks(preview_text: Option<&str>) -> Vec<Block> {
                 "PrvText preview stream was missing, so only container diagnostics are available."
                     .to_string(),
             ),
+            page_break_before: false,
         }));
     }
     blocks
@@ -1781,9 +2463,7 @@ fn decode_utf16_le(bytes: &[u8]) -> String {
         .chunks_exact(2)
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
-    String::from_utf16_lossy(&units)
-        .trim_matches('\u{0}')
-        .to_string()
+    normalize_hwp_text(String::from_utf16_lossy(&units).trim_matches('\u{0}'))
 }
 
 fn decode_utf16_be(bytes: &[u8]) -> String {
@@ -1791,9 +2471,28 @@ fn decode_utf16_be(bytes: &[u8]) -> String {
         .chunks_exact(2)
         .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
         .collect::<Vec<_>>();
-    String::from_utf16_lossy(&units)
-        .trim_matches('\u{0}')
-        .to_string()
+    normalize_hwp_text(String::from_utf16_lossy(&units).trim_matches('\u{0}'))
+}
+
+fn normalize_hwp_text(text: impl AsRef<str>) -> String {
+    let text = text.as_ref();
+    if !text.chars().any(|ch| matches!(ch, '\u{f53a}')) {
+        return text.to_string();
+    }
+
+    let mut normalized = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            // HWP text can contain legacy Hanyang PUA syllables directly.
+            // pyhwp/hypua2jamo map U+F53A to the historic reading "ᄒᆞᆫ", but
+            // current WebKit does not shape that sequence like Hanword here.
+            // Collapse it to the rendered modern syllable so the page matches
+            // the source document's visible "한글" wording.
+            '\u{f53a}' => normalized.push('한'),
+            _ => normalized.push(ch),
+        }
+    }
+    normalized
 }
 
 fn split_preview_paragraphs(text: &str) -> Vec<&str> {
@@ -1898,6 +2597,63 @@ mod tests {
             }
             _ => panic!("expected paragraph block"),
         }
+    }
+
+    #[test]
+    fn normalizes_known_hanyang_pua_text() {
+        let bytes = [0x3a, 0xf5, 0x00, 0xae];
+        assert_eq!(decode_utf16_le(&bytes), "한글");
+    }
+
+    #[test]
+    fn parses_para_line_segments_and_height_hint() {
+        let mut payload = Vec::new();
+        for (chpos, y, height, space_below) in [(0i32, 0i32, 1000i32, 120i32), (12, 1120, 1000, 80)]
+        {
+            payload.extend_from_slice(&chpos.to_le_bytes());
+            payload.extend_from_slice(&y.to_le_bytes());
+            payload.extend_from_slice(&height.to_le_bytes());
+            payload.extend_from_slice(&1000i32.to_le_bytes()); // height_text
+            payload.extend_from_slice(&850i32.to_le_bytes()); // height_baseline
+            payload.extend_from_slice(&space_below.to_le_bytes());
+            payload.extend_from_slice(&0i32.to_le_bytes()); // x
+            payload.extend_from_slice(&4000i32.to_le_bytes()); // width
+            payload.extend_from_slice(&0u32.to_le_bytes()); // flags
+        }
+
+        let line_segments = parse_para_line_segs(&payload);
+        assert_eq!(line_segments.len(), 2);
+        assert_eq!(line_segments[1].chpos, 12);
+        assert_eq!(paragraph_layout_height_hint(&line_segments), Some(2200));
+    }
+
+    #[test]
+    fn injects_line_breaks_from_line_segments() {
+        let runs = vec![TextRun {
+            text: "사업계획서 작성 및 제출 요령".to_string(),
+            style: Some(TextStyle::default()),
+        }];
+        let line_segments = vec![
+            HwpLineSegment {
+                chpos: 0,
+                y: 0,
+                height: 1000,
+                space_below: 0,
+            },
+            HwpLineSegment {
+                chpos: 8,
+                y: 1000,
+                height: 1000,
+                space_below: 0,
+            },
+        ];
+
+        let broken = apply_line_seg_breaks_to_runs(runs, &line_segments);
+        let joined = broken
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>();
+        assert_eq!(joined, "사업계획서 작성\n 및 제출 요령");
     }
 
     #[test]
@@ -2023,12 +2779,426 @@ mod tests {
                 assert!(paragraph.runs[0].text.contains("스타일"));
                 let style = paragraph.runs[0].style.as_ref().expect("should have style");
                 assert_eq!(style.font_family.as_deref(), Some("함초롬바탕"));
-                assert_eq!(style.font_size, Some(10));
+                assert_eq!(style.font_size, Some(1000));
                 assert!(style.bold);
                 assert_eq!(style.text_color.as_deref(), Some("#ff0000"));
+                assert_eq!(style.underline_color, None);
             }
             _ => panic!("expected paragraph block"),
         }
+    }
+
+    #[test]
+    fn parses_char_shape_underline_color() {
+        let mut cs_data = vec![0u8; 72];
+        cs_data[42..46].copy_from_slice(&1100u32.to_le_bytes());
+        cs_data[46..50].copy_from_slice(&(1u32 << 2).to_le_bytes());
+        cs_data[56..60].copy_from_slice(&0x00ff00u32.to_le_bytes());
+
+        let cs = parse_char_shape(&cs_data);
+        let style = char_shape_to_text_style(&cs, &[]);
+
+        assert!(style.underline);
+        assert_eq!(style.underline_color.as_deref(), Some("#00ff00"));
+    }
+
+    #[test]
+    fn ignores_reserved_underline_kind() {
+        let mut cs_data = vec![0u8; 72];
+        cs_data[46..50].copy_from_slice(&(2u32 << 2).to_le_bytes());
+        cs_data[56..60].copy_from_slice(&0x0000ffu32.to_le_bytes());
+
+        let cs = parse_char_shape(&cs_data);
+        let style = char_shape_to_text_style(&cs, &[]);
+
+        assert!(!style.underline);
+        assert_eq!(style.underline_color, None);
+    }
+
+    #[test]
+    fn paragraph_alignment_uses_bits_two_to_four() {
+        let style = para_shape_to_paragraph_style(&ParaShape {
+            attributes: 3u32 << 2,
+            ..ParaShape::default()
+        });
+
+        assert_eq!(style.align.as_deref(), Some("CENTER"));
+    }
+
+    #[test]
+    fn parses_page_def_from_section_control_with_real_tag_ids() {
+        let mut compound = CompoundFile::create(Cursor::new(Vec::new())).unwrap();
+        make_file_header_stream(&mut compound, 0);
+
+        {
+            compound.create_storage(BODY_TEXT_STORAGE).unwrap();
+
+            let mut payload = Vec::new();
+            write_record(&mut payload, HWPTAG_CTRL_HEADER, 0, b"dces");
+            write_record(&mut payload, HWPTAG_LIST_HEADER, 1, &[0u8; 14]);
+
+            let mut page_def = Vec::new();
+            page_def.extend_from_slice(&12240i32.to_le_bytes());
+            page_def.extend_from_slice(&15840i32.to_le_bytes());
+            page_def.extend_from_slice(&1800i32.to_le_bytes());
+            page_def.extend_from_slice(&1800i32.to_le_bytes());
+            page_def.extend_from_slice(&1440i32.to_le_bytes());
+            page_def.extend_from_slice(&1440i32.to_le_bytes());
+            page_def.extend_from_slice(&720i32.to_le_bytes());
+            page_def.extend_from_slice(&720i32.to_le_bytes());
+            page_def.extend_from_slice(&0i32.to_le_bytes());
+            page_def.extend_from_slice(&0u32.to_le_bytes());
+            write_record(&mut payload, HWPTAG_PAGE_DEF, 1, &page_def);
+
+            let mut para_header = vec![0u8; 22];
+            para_header[..4].copy_from_slice(&4u32.to_le_bytes());
+            write_record(&mut payload, HWPTAG_PARA_HEADER, 0, &para_header);
+
+            let text_units = "본문"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>();
+            write_record(&mut payload, HWPTAG_PARA_TEXT, 1, &text_units);
+
+            let mut stream = compound.create_stream("/BodyText/Section0").unwrap();
+            stream.write_all(&payload).unwrap();
+        }
+
+        let bytes = compound.into_inner().into_inner();
+        let parsed = HwpInspector
+            .parse_bytes(&bytes, Some("page-def.hwp"))
+            .expect("page def should parse");
+
+        let layout = parsed.document.sections[0]
+            .page_layout
+            .as_ref()
+            .expect("section should expose page layout");
+        assert_eq!(layout.width, Some(12240));
+        assert_eq!(layout.height, Some(15840));
+        assert_eq!(layout.margin_left, Some(1800));
+        assert_eq!(layout.margin_top, Some(1440));
+        assert!(!layout.landscape);
+    }
+
+    #[test]
+    fn strips_extended_control_payloads_from_para_text() {
+        let bytes = [
+            0x02, 0x00, 0x64, 0x63, 0x65, 0x73, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+            0x21, 0x00, 0x0d, 0x00,
+        ];
+        let units = extract_text_units(&bytes, None);
+        assert_eq!(units, vec![0x21, 0x0d]);
+    }
+
+    #[test]
+    fn parses_table_cell_descriptor_from_hwp_list_header() {
+        let data = [
+            0x01, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00,
+            0x01, 0x00, 0x95, 0xbb, 0x00, 0x00, 0xa9, 0x0a, 0x00, 0x00, 0x8d, 0x00, 0x8d, 0x00,
+            0x8d, 0x00, 0x8d, 0x00, 0x22, 0x00, 0x95, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let (
+            col,
+            row,
+            col_span,
+            row_span,
+            width,
+            height,
+            margin_left,
+            margin_right,
+            margin_top,
+            margin_bottom,
+            border_fill_id,
+        ) = parse_list_header_as_cell(&data);
+        assert_eq!((col, row, col_span, row_span), (0, 0, 6, 1));
+        assert_eq!(width, 48021);
+        assert_eq!(height, 2729);
+        assert_eq!(
+            (margin_left, margin_right, margin_top, margin_bottom),
+            (141, 141, 141, 141)
+        );
+        assert_eq!(border_fill_id, Some(34));
+    }
+
+    #[test]
+    fn does_not_treat_diagonal_bytes_as_background_fill() {
+        let mut data = vec![0u8; 32];
+        data[26] = 1;
+        data[27] = 0;
+        data[28..32].copy_from_slice(&0x0000_0100u32.to_le_bytes());
+
+        let border_fill = parse_border_fill(&data);
+        assert_eq!(border_fill.background_color, None);
+    }
+
+    #[test]
+    fn reads_solid_fill_background_from_fill_stream() {
+        let mut data = vec![0u8; 49];
+        data[32..36].copy_from_slice(&0x0000_0001u32.to_le_bytes());
+        data[36..40].copy_from_slice(&0x00ff_0000u32.to_le_bytes());
+
+        let border_fill = parse_border_fill(&data);
+        assert_eq!(border_fill.background_color.as_deref(), Some("#0000ff"));
+    }
+
+    #[test]
+    fn reads_gradation_fill_as_css_background_image() {
+        let mut data = vec![0u8; 70];
+        data[32..36].copy_from_slice(&0x0000_0004u32.to_le_bytes());
+        data[36] = 2;
+        data[37..41].copy_from_slice(&90i32.to_le_bytes());
+        data[41..45].copy_from_slice(&0i32.to_le_bytes());
+        data[45..49].copy_from_slice(&0i32.to_le_bytes());
+        data[49..53].copy_from_slice(&0i32.to_le_bytes());
+        data[53..57].copy_from_slice(&2i32.to_le_bytes());
+        data[57..61].copy_from_slice(&0x0000_00ffu32.to_le_bytes());
+        data[61..65].copy_from_slice(&0x00ff_0000u32.to_le_bytes());
+        data[65..69].copy_from_slice(&1u32.to_le_bytes());
+        data[69] = 50;
+
+        let border_fill = parse_border_fill(&data);
+        assert_eq!(
+            border_fill.background_image.as_deref(),
+            Some("linear-gradient(90deg, #ff0000, #0000ff)")
+        );
+    }
+
+    #[test]
+    fn parses_border_fill_from_repeated_border_structs() {
+        let mut data = vec![0u8; 49];
+        data[2] = 8; // left: double
+        data[3] = 8; // left width = 0.60mm
+        data[4..8].copy_from_slice(&0x0000_00ffu32.to_le_bytes()); // left red
+
+        data[8] = 1; // right: solid
+        data[9] = 0; // right width = 0.10mm
+        data[10..14].copy_from_slice(&0x0000_ff00u32.to_le_bytes()); // right green
+
+        data[14] = 6; // top: long dash
+        data[15] = 10; // top width = 1.00mm
+        data[16..20].copy_from_slice(&0x00ff_0000u32.to_le_bytes()); // top blue
+
+        data[20] = 3; // bottom: dot
+        data[21] = 3; // bottom width = 0.20mm
+        data[22..26].copy_from_slice(&0x00ff_ffffu32.to_le_bytes()); // bottom yellow
+
+        let border_fill = parse_border_fill(&data);
+        assert_eq!(
+            border_fill
+                .border_left
+                .as_ref()
+                .and_then(|b| b.style.as_deref()),
+            Some("DOUBLE")
+        );
+        assert_eq!(
+            border_fill
+                .border_left
+                .as_ref()
+                .and_then(|b| b.width.as_deref()),
+            Some("0.60 mm")
+        );
+        assert_eq!(
+            border_fill
+                .border_left
+                .as_ref()
+                .and_then(|b| b.color.as_deref()),
+            Some("#ff0000")
+        );
+        assert_eq!(
+            border_fill
+                .border_top
+                .as_ref()
+                .and_then(|b| b.style.as_deref()),
+            Some("LONG_DASH")
+        );
+        assert_eq!(
+            border_fill
+                .border_bottom
+                .as_ref()
+                .and_then(|b| b.style.as_deref()),
+            Some("DOT")
+        );
+    }
+
+    #[test]
+    fn masks_hwp_border_style_flags_to_low_nibble() {
+        let mut data = vec![0u8; 49];
+        data[2] = 0x11; // low nibble = 1 => solid
+        data[3] = 0x06; // low nibble = 6 => 0.40mm
+        data[8] = 0x00; // none
+        data[9] = 0x01; // 0.12mm
+
+        let border_fill = parse_border_fill(&data);
+        assert_eq!(
+            border_fill
+                .border_left
+                .as_ref()
+                .and_then(|b| b.style.as_deref()),
+            Some("SOLID")
+        );
+        assert_eq!(
+            border_fill
+                .border_left
+                .as_ref()
+                .and_then(|b| b.width.as_deref()),
+            Some("0.40 mm")
+        );
+        assert_eq!(
+            border_fill
+                .border_right
+                .as_ref()
+                .and_then(|b| b.style.as_deref()),
+            Some("NONE")
+        );
+    }
+
+    #[test]
+    fn assemble_table_respects_column_addresses() {
+        let table = assemble_table(
+            2,
+            3,
+            vec![
+                CellDef {
+                    col_addr: 1,
+                    row_addr: 0,
+                    col_span: 1,
+                    row_span: 1,
+                    width: 1000,
+                    height: 0,
+                    margin_left: 0,
+                    margin_right: 0,
+                    margin_top: 0,
+                    margin_bottom: 0,
+                    border_fill_id: None,
+                    blocks: vec![Block::Paragraph(Paragraph {
+                        runs: vec![TextRun {
+                            text: "middle".to_string(),
+                            style: None,
+                        }],
+                        ..Paragraph::default()
+                    })],
+                },
+                CellDef {
+                    col_addr: 0,
+                    row_addr: 1,
+                    col_span: 1,
+                    row_span: 1,
+                    width: 1000,
+                    height: 0,
+                    margin_left: 0,
+                    margin_right: 0,
+                    margin_top: 0,
+                    margin_bottom: 0,
+                    border_fill_id: None,
+                    blocks: vec![Block::Paragraph(Paragraph {
+                        runs: vec![TextRun {
+                            text: "left".to_string(),
+                            style: None,
+                        }],
+                        ..Paragraph::default()
+                    })],
+                },
+            ],
+            &DocInfoStore::default(),
+        );
+
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0].cells.len(), 3);
+        assert_eq!(table.rows[0].cells[0].text, "");
+        assert_eq!(table.rows[0].cells[1].text, "middle");
+        assert_eq!(table.rows[0].cells[2].text, "");
+        assert_eq!(table.rows[1].cells.len(), 3);
+        assert_eq!(table.rows[1].cells[0].text, "left");
+    }
+
+    #[test]
+    fn distributes_multiple_inline_images_across_empty_cells() {
+        let table = assemble_table(
+            1,
+            2,
+            vec![CellDef {
+                col_addr: 0,
+                row_addr: 0,
+                col_span: 1,
+                row_span: 1,
+                width: 23809,
+                height: 6798,
+                margin_left: 510,
+                margin_right: 510,
+                margin_top: 141,
+                margin_bottom: 141,
+                border_fill_id: None,
+                blocks: vec![
+                    Block::Image(ImageBlock {
+                        asset_id: "BIN0001.jpg".to_string(),
+                        treat_as_char: true,
+                        ..ImageBlock::default()
+                    }),
+                    Block::Image(ImageBlock {
+                        asset_id: "BIN0002.jpg".to_string(),
+                        treat_as_char: true,
+                        ..ImageBlock::default()
+                    }),
+                ],
+            }],
+            &DocInfoStore::default(),
+        );
+
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].cells.len(), 2);
+        assert_eq!(table.rows[0].cells[0].blocks.len(), 1);
+        assert_eq!(table.rows[0].cells[1].blocks.len(), 1);
+        let first = match &table.rows[0].cells[0].blocks[0] {
+            Block::Image(image) => image.asset_id.as_str(),
+            _ => panic!("expected image in first cell"),
+        };
+        let second = match &table.rows[0].cells[1].blocks[0] {
+            Block::Image(image) => image.asset_id.as_str(),
+            _ => panic!("expected image in second cell"),
+        };
+        assert_eq!(first, "BIN0001.jpg");
+        assert_eq!(second, "BIN0002.jpg");
+    }
+
+    #[test]
+    fn parses_gso_picture_dimensions_from_common_object_properties() {
+        let mut ctrl = vec![0u8; 46];
+        ctrl[..4].copy_from_slice(b" gso");
+        ctrl[4..8].copy_from_slice(&0u32.to_le_bytes());
+        ctrl[16..20].copy_from_slice(&15153i32.to_le_bytes());
+        ctrl[20..24].copy_from_slice(&4345i32.to_le_bytes());
+        ctrl[24..28].copy_from_slice(&3i32.to_le_bytes());
+
+        let mut picture = vec![0u8; 91];
+        picture[71..73].copy_from_slice(&1u16.to_le_bytes());
+
+        let assets = vec![AssetRef {
+            id: "BIN0001.jpg".to_string(),
+            media_type: "image/jpeg".to_string(),
+            source_path: Some("/BinData/BIN0001.jpg".to_string()),
+            data_uri: None,
+        }];
+        let records = vec![
+            Record {
+                tag_id: HWPTAG_CTRL_HEADER,
+                level: 3,
+                data: &ctrl,
+            },
+            Record {
+                tag_id: HWPTAG_SHAPE_COMPONENT_PICTURE,
+                level: 4,
+                data: &picture,
+            },
+        ];
+
+        let (image, consumed) = parse_gso_control(&records, &DocInfoStore::default(), &assets);
+        assert_eq!(consumed, 2);
+        let image = image.expect("picture should parse");
+        assert_eq!(image.asset_id, "BIN0001.jpg");
+        assert_eq!(image.width, Some(15153));
+        assert_eq!(image.height, Some(4345));
+        assert_eq!(image.z_order, Some(3));
     }
 
     #[test]

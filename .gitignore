@@ -3,3 +3,4 @@ dist/
 target/
 .DS_Store
 vite.config.ts.timestamp-*
+packages/viewer-ui/public/dev-fixtures/kursorai-pdf.json
