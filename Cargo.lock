@@ -2324,6 +2324,7 @@ dependencies = [
  "max_viewer_layout",
  "max_viewer_markdown",
  "max_viewer_pdf",
+ "max_viewer_text",
  "rfd",
  "serde",
  "serde_json",
@@ -2382,6 +2383,13 @@ name = "max_viewer_pdf"
 version = "0.1.0"
 dependencies = [
  "lopdf",
+ "max_viewer_core",
+]
+
+[[package]]
+name = "max_viewer_text"
+version = "0.1.0"
+dependencies = [
  "max_viewer_core",
 ]
 

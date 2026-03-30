@@ -1,6 +1,6 @@
 # MAX-Viewer
 
-MAX-Viewer는 `.hwp`와 `.hwpx` 문서를 읽기 전용으로 열람하기 위한 멀티플랫폼 뷰어 프로젝트입니다.
+MAX-Viewer는 `.hwp`, `.hwpx`, `.md`, `.txt`, `.pdf` 문서를 열람하고 일부 텍스트 형식을 편집할 수 있는 멀티플랫폼 뷰어 프로젝트입니다.
 
 현재 스캐폴드는 다음 구조를 기준으로 잡혀 있습니다.
 
@@ -38,6 +38,7 @@ MAX-Viewer/
 - `max_viewer_core`: 공통 문서 모델과 파서 진단 타입
 - `max_viewer_hwpx`: HWPX ZIP, `content.hpf`, `header.xml`, `section*.xml` 파서와 스타일/번호/머리말/표/개체 배치 해석
 - `max_viewer_hwp`: HWP `FileHeader`, 최소 `BodyText` 문단 복원, `PrvText` fallback preview 파서
+- `max_viewer_text`: UTF-8 TXT 파서와 줄 단위 페이지 미리보기/편집용 문서 모델 변환
 - `max_viewer_layout`: 문서 블록 수 기반 레이아웃 요약
 - `max_viewer_export`: 내부 문서 모델의 텍스트 추출 스캐폴드
 - `apps/desktop-tauri`: Tauri 명령, 네이티브 파일 열기 다이얼로그, 실제 문서 로드 셸

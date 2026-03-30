@@ -5,6 +5,7 @@ members = [
   "crates/max_viewer_hwp",
   "crates/max_viewer_pdf",
   "crates/max_viewer_markdown",
+  "crates/max_viewer_text",
   "crates/max_viewer_layout",
   "crates/max_viewer_export",
   "apps/desktop-tauri/src-tauri",
@@ -28,6 +29,7 @@ max_viewer_hwpx = { path = "crates/max_viewer_hwpx" }
 max_viewer_hwp = { path = "crates/max_viewer_hwp" }
 max_viewer_pdf = { path = "crates/max_viewer_pdf" }
 max_viewer_markdown = { path = "crates/max_viewer_markdown" }
+max_viewer_text = { path = "crates/max_viewer_text" }
 max_viewer_layout = { path = "crates/max_viewer_layout" }
 max_viewer_export = { path = "crates/max_viewer_export" }
 lopdf = "0.38"

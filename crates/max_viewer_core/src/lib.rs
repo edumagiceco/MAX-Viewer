@@ -10,6 +10,7 @@ pub enum DocumentFormat {
     Hwpx,
     Pdf,
     Markdown,
+    Text,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

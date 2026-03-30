@@ -15,9 +15,10 @@ use max_viewer_core::{
 use max_viewer_export::to_plain_text;
 use max_viewer_hwp::HwpInspector;
 use max_viewer_hwpx::HwpxInspector;
+use max_viewer_layout::{LayoutSummary, summarize};
 use max_viewer_markdown::MarkdownInspector;
 use max_viewer_pdf::PdfInspector;
-use max_viewer_layout::{LayoutSummary, summarize};
+use max_viewer_text::TextInspector;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -97,6 +98,7 @@ fn app_info() -> DesktopAppInfo {
             "max_viewer_hwpx".to_string(),
             "max_viewer_hwp".to_string(),
             "max_viewer_markdown".to_string(),
+            "max_viewer_text".to_string(),
             "max_viewer_pdf".to_string(),
             "max_viewer_layout".to_string(),
             "max_viewer_export".to_string(),
@@ -105,6 +107,7 @@ fn app_info() -> DesktopAppInfo {
             HwpxInspector::scaffold_support(),
             HwpInspector::scaffold_support(),
             MarkdownInspector::scaffold_support(),
+            TextInspector::scaffold_support(),
             PdfInspector::scaffold_support(),
         ],
         roadmap: vec![
@@ -276,6 +279,34 @@ fn parse_markdown_text(
 }
 
 #[tauri::command]
+fn parse_text_source(
+    file_name: String,
+    file_path: Option<String>,
+    source_text: String,
+) -> Result<LoadedDocument, String> {
+    let inspector = TextInspector;
+    let parsed = inspector
+        .parse_bytes(
+            source_text.as_bytes(),
+            Path::new(&file_name)
+                .file_stem()
+                .and_then(|stem| stem.to_str()),
+        )
+        .map_err(|error| error.to_string())?;
+
+    Ok(build_loaded_document(
+        file_name,
+        file_path,
+        parsed.document,
+        parsed.diagnostics,
+        Some(source_text),
+        None,
+        None,
+        true,
+    ))
+}
+
+#[tauri::command]
 fn save_markdown_document(
     file_path: String,
     source_text: String,
@@ -291,17 +322,28 @@ fn save_markdown_document(
 }
 
 #[tauri::command]
+fn save_text_document(file_path: String, source_text: String) -> Result<LoadedDocument, String> {
+    fs::write(&file_path, source_text.as_bytes()).map_err(|error| error.to_string())?;
+    let file_name = Path::new(&file_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document.txt")
+        .to_string();
+
+    parse_text_source(file_name, Some(file_path), source_text)
+}
+
+#[tauri::command]
 fn save_markdown_document_as(
     suggested_file_name: String,
     source_text: String,
 ) -> Result<Option<LoadedDocument>, String> {
-    let default_name = if suggested_file_name.ends_with(".md")
-        || suggested_file_name.ends_with(".markdown")
-    {
-        suggested_file_name
-    } else {
-        format!("{suggested_file_name}.md")
-    };
+    let default_name =
+        if suggested_file_name.ends_with(".md") || suggested_file_name.ends_with(".markdown") {
+            suggested_file_name
+        } else {
+            format!("{suggested_file_name}.md")
+        };
 
     let Some(path) = rfd::FileDialog::new()
         .add_filter("Markdown", &["md", "markdown"])
@@ -323,6 +365,36 @@ fn save_markdown_document_as(
 }
 
 #[tauri::command]
+fn save_text_document_as(
+    suggested_file_name: String,
+    source_text: String,
+) -> Result<Option<LoadedDocument>, String> {
+    let default_name = if suggested_file_name.ends_with(".txt") {
+        suggested_file_name
+    } else {
+        format!("{suggested_file_name}.txt")
+    };
+
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("Text", &["txt"])
+        .set_file_name(&default_name)
+        .save_file()
+    else {
+        return Ok(None);
+    };
+
+    let file_path = path.to_string_lossy().into_owned();
+    fs::write(&file_path, source_text.as_bytes()).map_err(|error| error.to_string())?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document.txt")
+        .to_string();
+
+    parse_text_source(file_name, Some(file_path), source_text).map(Some)
+}
+
+#[tauri::command]
 fn print_current_document(webview_window: tauri::WebviewWindow) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -340,7 +412,10 @@ fn print_current_document(webview_window: tauri::WebviewWindow) -> Result<(), St
 #[tauri::command]
 fn pick_and_open_document() -> Result<Option<LoadedDocument>, String> {
     let Some(path) = rfd::FileDialog::new()
-        .add_filter("Supported documents", &["hwp", "hwpx", "md", "markdown", "pdf"])
+        .add_filter(
+            "Supported documents",
+            &["hwp", "hwpx", "md", "markdown", "txt", "pdf"],
+        )
         .pick_file()
     else {
         return Ok(None);
@@ -378,68 +453,60 @@ fn load_document(
     let hwpx = HwpxInspector;
     let hwp = HwpInspector;
     let markdown = MarkdownInspector;
+    let text = TextInspector;
     let pdf = PdfInspector;
 
     let (document, diagnostics, source_text, binary_data_uri, binary_mime_type, is_editable) =
         match extension.as_deref() {
-        Some("hwpx") => {
-            let parsed = hwpx
-                .parse_bytes(&bytes, fallback_title)
-                .map_err(|error| error.to_string())?;
-            (parsed.document, parsed.diagnostics, None, None, None, false)
-        }
-        Some("hwp") => {
-            let parsed = hwp
-                .parse_bytes(&bytes, fallback_title)
-                .map_err(|error| error.to_string())?;
-            (parsed.document, parsed.diagnostics, None, None, None, false)
-        }
-        Some("md") | Some("markdown") => {
-            let source_text =
-                String::from_utf8(bytes.to_vec()).map_err(|error| error.to_string())?;
-            let parsed = markdown
-                .parse_bytes_with_base_dir(
-                    source_text.as_bytes(),
-                    fallback_title,
-                    file_path
-                        .as_deref()
-                        .and_then(|path| Path::new(path).parent()),
-                )
-                .map_err(|error| error.to_string())?;
-            (
-                parsed.document,
-                parsed.diagnostics,
-                Some(source_text),
-                None,
-                None,
-                true,
-            )
-        }
-        Some("pdf") => {
-            let parsed = pdf
-                .parse_bytes(bytes, fallback_title)
-                .map_err(|error| error.to_string())?;
-            (
-                parsed.document,
-                parsed.diagnostics,
-                None,
-                Some(pdf_data_uri(bytes)),
-                Some("application/pdf".to_string()),
-                false,
-            )
-        }
-        _ => {
-            if hwpx.inspect_bytes(&bytes).is_ok() {
+            Some("hwpx") => {
                 let parsed = hwpx
                     .parse_bytes(&bytes, fallback_title)
                     .map_err(|error| error.to_string())?;
                 (parsed.document, parsed.diagnostics, None, None, None, false)
-            } else if hwp.inspect_bytes(&bytes).is_ok() {
+            }
+            Some("hwp") => {
                 let parsed = hwp
                     .parse_bytes(&bytes, fallback_title)
                     .map_err(|error| error.to_string())?;
                 (parsed.document, parsed.diagnostics, None, None, None, false)
-            } else if pdf.inspect_bytes(bytes).is_ok() {
+            }
+            Some("md") | Some("markdown") => {
+                let source_text =
+                    String::from_utf8(bytes.to_vec()).map_err(|error| error.to_string())?;
+                let parsed = markdown
+                    .parse_bytes_with_base_dir(
+                        source_text.as_bytes(),
+                        fallback_title,
+                        file_path
+                            .as_deref()
+                            .and_then(|path| Path::new(path).parent()),
+                    )
+                    .map_err(|error| error.to_string())?;
+                (
+                    parsed.document,
+                    parsed.diagnostics,
+                    Some(source_text),
+                    None,
+                    None,
+                    true,
+                )
+            }
+            Some("txt") => {
+                let source_text =
+                    String::from_utf8(bytes.to_vec()).map_err(|error| error.to_string())?;
+                let parsed = text
+                    .parse_bytes(source_text.as_bytes(), fallback_title)
+                    .map_err(|error| error.to_string())?;
+                (
+                    parsed.document,
+                    parsed.diagnostics,
+                    Some(source_text),
+                    None,
+                    None,
+                    true,
+                )
+            }
+            Some("pdf") => {
                 let parsed = pdf
                     .parse_bytes(bytes, fallback_title)
                     .map_err(|error| error.to_string())?;
@@ -451,14 +518,38 @@ fn load_document(
                     Some("application/pdf".to_string()),
                     false,
                 )
-            } else {
-                return Err(
-                    "Unsupported document type. Select a .hwpx, .hwp, .md, or .pdf file."
-                        .to_string(),
-                );
             }
-        }
-    };
+            _ => {
+                if hwpx.inspect_bytes(&bytes).is_ok() {
+                    let parsed = hwpx
+                        .parse_bytes(&bytes, fallback_title)
+                        .map_err(|error| error.to_string())?;
+                    (parsed.document, parsed.diagnostics, None, None, None, false)
+                } else if hwp.inspect_bytes(&bytes).is_ok() {
+                    let parsed = hwp
+                        .parse_bytes(&bytes, fallback_title)
+                        .map_err(|error| error.to_string())?;
+                    (parsed.document, parsed.diagnostics, None, None, None, false)
+                } else if pdf.inspect_bytes(bytes).is_ok() {
+                    let parsed = pdf
+                        .parse_bytes(bytes, fallback_title)
+                        .map_err(|error| error.to_string())?;
+                    (
+                        parsed.document,
+                        parsed.diagnostics,
+                        None,
+                        Some(pdf_data_uri(bytes)),
+                        Some("application/pdf".to_string()),
+                        false,
+                    )
+                } else {
+                    return Err(
+                        "Unsupported document type. Select a .hwpx, .hwp, .md, .txt, or .pdf file."
+                            .to_string(),
+                    );
+                }
+            }
+        };
 
     Ok(build_loaded_document(
         file_name.to_string(),
@@ -508,8 +599,11 @@ fn main() {
             extract_pdf_search_text,
             extract_pdf_search_text_bytes,
             parse_markdown_text,
+            parse_text_source,
             save_markdown_document,
+            save_text_document,
             save_markdown_document_as,
+            save_text_document_as,
             print_current_document,
             pick_and_open_document
         ])

@@ -24,7 +24,8 @@ GlobalWorkerOptions.workerSrc = new URL(
   import.meta.url,
 ).toString()
 
-type FormatName = 'hwp' | 'hwpx' | 'markdown' | 'pdf'
+type FormatName = 'hwp' | 'hwpx' | 'markdown' | 'pdf' | 'text'
+type EditableDocumentFormat = 'markdown' | 'text'
 type ZoomMode = 'fitWidth' | 'manual'
 type PageViewMode = 'single' | 'twoUp' | 'fourUp'
 
@@ -489,7 +490,9 @@ function normalizeFixtureDocument(payload: DevFixturePayload, fixtureUrl: string
       sourceText: loadedPayload.sourceText ?? null,
       binaryDataUri: loadedPayload.binaryDataUri ?? null,
       binaryMimeType: loadedPayload.binaryMimeType ?? null,
-      isEditable: loadedPayload.isEditable ?? loadedPayload.document.format === 'markdown',
+      isEditable:
+        loadedPayload.isEditable ??
+        isEditableSourceFormat(loadedPayload.document.format),
     }
   }
 
@@ -500,7 +503,7 @@ function normalizeFixtureDocument(payload: DevFixturePayload, fixtureUrl: string
     sourceText: null,
     binaryDataUri: null,
     binaryMimeType: null,
-    isEditable: document.format === 'markdown',
+    isEditable: isEditableSourceFormat(document.format),
     diagnostics: {
       format: document.format ?? 'hwp',
       sectionCount: document.sections.length,
@@ -560,6 +563,41 @@ async function saveMarkdownSourceAs(
 ): Promise<LoadedDocument | null> {
   const { invoke } = await import('@tauri-apps/api/core')
   return await invoke<LoadedDocument | null>('save_markdown_document_as', {
+    suggestedFileName,
+    sourceText,
+  })
+}
+
+async function parseTextSource(
+  fileName: string,
+  filePath: string | null | undefined,
+  sourceText: string,
+): Promise<LoadedDocument> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  return await invoke<LoadedDocument>('parse_text_source', {
+    fileName,
+    filePath: filePath ?? null,
+    sourceText,
+  })
+}
+
+async function saveTextSource(
+  filePath: string,
+  sourceText: string,
+): Promise<LoadedDocument> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  return await invoke<LoadedDocument>('save_text_document', {
+    filePath,
+    sourceText,
+  })
+}
+
+async function saveTextSourceAs(
+  suggestedFileName: string,
+  sourceText: string,
+): Promise<LoadedDocument | null> {
+  const { invoke } = await import('@tauri-apps/api/core')
+  return await invoke<LoadedDocument | null>('save_text_document_as', {
     suggestedFileName,
     sourceText,
   })
@@ -633,6 +671,9 @@ function formatLabel(format?: FormatName | null): string {
   if (format === 'markdown') {
     return 'MD'
   }
+  if (format === 'text') {
+    return 'TXT'
+  }
   return format?.toUpperCase() ?? 'Unknown'
 }
 
@@ -640,16 +681,67 @@ function resolvedDocumentFormat(document: LoadedDocument | null | undefined): Fo
   return document?.document.format ?? document?.diagnostics.format
 }
 
-function isMarkdownDocument(document: LoadedDocument | null | undefined): boolean {
-  return resolvedDocumentFormat(document) === 'markdown'
+function isEditableSourceFormat(
+  format?: FormatName | null,
+): format is EditableDocumentFormat {
+  return format === 'markdown' || format === 'text'
+}
+
+function isTextDocument(document: LoadedDocument | null | undefined): boolean {
+  return resolvedDocumentFormat(document) === 'text'
+}
+
+function editableDocumentFormat(
+  document: LoadedDocument | null | undefined,
+): EditableDocumentFormat | null {
+  const format = resolvedDocumentFormat(document)
+  return isEditableSourceFormat(format) ? format : null
 }
 
 function isPdfDocument(document: LoadedDocument | null | undefined): boolean {
   return resolvedDocumentFormat(document) === 'pdf'
 }
 
-function markdownDocumentIdentity(document: LoadedDocument): string {
-  return document.filePath ?? `memory:${document.fileName}`
+function editableDocumentIdentity(document: LoadedDocument): string {
+  const format = editableDocumentFormat(document) ?? 'readonly'
+  return `${format}:${document.filePath ?? `memory:${document.fileName}`}`
+}
+
+async function parseEditableSource(
+  format: EditableDocumentFormat,
+  fileName: string,
+  filePath: string | null | undefined,
+  sourceText: string,
+): Promise<LoadedDocument> {
+  if (format === 'text') {
+    return await parseTextSource(fileName, filePath, sourceText)
+  }
+
+  return await parseMarkdownSource(fileName, filePath, sourceText)
+}
+
+async function saveEditableSource(
+  format: EditableDocumentFormat,
+  filePath: string,
+  sourceText: string,
+): Promise<LoadedDocument> {
+  if (format === 'text') {
+    return await saveTextSource(filePath, sourceText)
+  }
+
+  return await saveMarkdownSource(filePath, sourceText)
+}
+
+async function saveEditableSourceAs(
+  format: EditableDocumentFormat,
+  suggestedFileName: string,
+  sourceText: string,
+): Promise<LoadedDocument | null> {
+  if (format === 'text') {
+    return await saveTextSourceAs(suggestedFileName, sourceText)
+  }
+
+  return await saveMarkdownSourceAs(suggestedFileName, sourceText)
 }
 
 function decodeDataUriToBytes(dataUri: string): Uint8Array {
@@ -3916,8 +4008,8 @@ function App() {
   const pageStackRef = useRef<HTMLDivElement | null>(null)
   const measureRefs = useRef<Record<number, HTMLDivElement | null>>({})
   const pendingViewportAnchorRef = useRef<ViewportPageAnchor | null>(null)
-  const markdownIdentityRef = useRef<string | null>(null)
-  const markdownParseRequestRef = useRef(0)
+  const editableDocumentIdentityRef = useRef<string | null>(null)
+  const editableParseRequestRef = useRef(0)
   const tauriAvailable = '__TAURI_INTERNALS__' in window
   const pageColumns = useMemo(
     () => resolvePageColumns(pageViewMode, workspaceWidth),
@@ -3974,8 +4066,8 @@ function App() {
   }, [loadedDocument])
 
   useEffect(() => {
-    if (!loadedDocument || !isMarkdownDocument(loadedDocument)) {
-      markdownIdentityRef.current = null
+    if (!loadedDocument || !editableDocumentFormat(loadedDocument)) {
+      editableDocumentIdentityRef.current = null
       setDocumentMode('view')
       setMarkdownSource('')
       setSavedMarkdownSource('')
@@ -3983,12 +4075,12 @@ function App() {
       return
     }
 
-    const identity = markdownDocumentIdentity(loadedDocument)
-    if (markdownIdentityRef.current === identity) {
+    const identity = editableDocumentIdentity(loadedDocument)
+    if (editableDocumentIdentityRef.current === identity) {
       return
     }
 
-    markdownIdentityRef.current = identity
+    editableDocumentIdentityRef.current = identity
     setDocumentMode('view')
     setMarkdownSource(loadedDocument.sourceText ?? '')
     setSavedMarkdownSource(loadedDocument.sourceText ?? '')
@@ -4356,18 +4448,19 @@ function App() {
   ])
 
   useEffect(() => {
-    if (!tauriAvailable || !loadedDocument || !isMarkdownDocument(loadedDocument) || documentMode !== 'edit') {
+    const format = editableDocumentFormat(loadedDocument)
+    if (!tauriAvailable || !loadedDocument || !format || documentMode !== 'edit') {
       return
     }
 
     const nextSource = markdownSource
     const fileName = loadedDocument.fileName
     const filePath = loadedDocument.filePath
-    const requestId = ++markdownParseRequestRef.current
+    const requestId = ++editableParseRequestRef.current
     const timer = window.setTimeout(() => {
-      void parseMarkdownSource(fileName, filePath, nextSource)
+      void parseEditableSource(format, fileName, filePath, nextSource)
         .then((document) => {
-          if (markdownParseRequestRef.current !== requestId) {
+          if (editableParseRequestRef.current !== requestId) {
             return
           }
           startTransition(() => {
@@ -4375,7 +4468,7 @@ function App() {
           })
         })
         .catch((error) => {
-          if (markdownParseRequestRef.current !== requestId) {
+          if (editableParseRequestRef.current !== requestId) {
             return
           }
           setOpenError(error instanceof Error ? error.message : String(error))
@@ -4531,8 +4624,8 @@ function App() {
   async function handleFileDrop(file: File) {
     if (!tauriAvailable) return
     const ext = file.name.split('.').pop()?.toLowerCase()
-    if (ext !== 'hwp' && ext !== 'hwpx' && ext !== 'md' && ext !== 'markdown' && ext !== 'pdf') {
-      setOpenError('지원하지 않는 파일 형식입니다. .hwp, .hwpx, .md, 또는 .pdf 파일을 사용하세요.')
+    if (ext !== 'hwp' && ext !== 'hwpx' && ext !== 'md' && ext !== 'markdown' && ext !== 'txt' && ext !== 'pdf') {
+      setOpenError('지원하지 않는 파일 형식입니다. .hwp, .hwpx, .md, .txt, 또는 .pdf 파일을 사용하세요.')
       return
     }
     setOpening(true)
@@ -4583,8 +4676,9 @@ function App() {
     }
   }
 
-  async function handleSaveMarkdown(saveAs: boolean) {
-    if (!tauriAvailable || !loadedDocument || !isMarkdownDocument(loadedDocument)) {
+  async function handleSaveSourceDocument(saveAs: boolean) {
+    const format = editableDocumentFormat(loadedDocument)
+    if (!tauriAvailable || !loadedDocument || !format) {
       return
     }
 
@@ -4593,14 +4687,14 @@ function App() {
 
     try {
       const savedDocument = saveAs || !loadedDocument.filePath
-        ? await saveMarkdownSourceAs(loadedDocument.fileName, markdownSource)
-        : await saveMarkdownSource(loadedDocument.filePath, markdownSource)
+        ? await saveEditableSourceAs(format, loadedDocument.fileName, markdownSource)
+        : await saveEditableSource(format, loadedDocument.filePath, markdownSource)
 
       if (!savedDocument) {
         return
       }
 
-      markdownIdentityRef.current = markdownDocumentIdentity(savedDocument)
+      editableDocumentIdentityRef.current = editableDocumentIdentity(savedDocument)
       startTransition(() => {
         setLoadedDocument(savedDocument)
         setSavedMarkdownSource(savedDocument.sourceText ?? markdownSource)
@@ -4637,21 +4731,23 @@ function App() {
   }
 
   async function handleDocumentModeChange(nextMode: 'view' | 'edit') {
+    const format = editableDocumentFormat(loadedDocument)
     if (
       nextMode === 'view' &&
       tauriAvailable &&
       loadedDocument &&
-      isMarkdownDocument(loadedDocument) &&
+      format &&
       markdownSource !== loadedDocument.sourceText
     ) {
       try {
-        const requestId = ++markdownParseRequestRef.current
-        const parsed = await parseMarkdownSource(
+        const requestId = ++editableParseRequestRef.current
+        const parsed = await parseEditableSource(
+          format,
           loadedDocument.fileName,
           loadedDocument.filePath,
           markdownSource,
         )
-        if (markdownParseRequestRef.current === requestId) {
+        if (editableParseRequestRef.current === requestId) {
           startTransition(() => {
             setLoadedDocument(parsed)
           })
@@ -4675,9 +4771,13 @@ function App() {
   const renderedPageCount = pdfDocumentActive ? pdfPageMetrics.length : renderedPages.length
   const displayedZoomPercent = zoomMode === 'fitWidth' ? 100 : zoomPercent
   const showScrollStatus = scrollStatus.horizontalOverflow || scrollStatus.verticalOverflow
-  const markdownEditable = activeDocument?.isEditable && isMarkdownDocument(activeDocument)
-  const markdownDirty = markdownEditable && markdownSource !== savedMarkdownSource
-  const showViewerChrome = !(markdownEditable && documentMode === 'edit')
+  const sourceEditable = activeDocument?.isEditable && Boolean(editableDocumentFormat(activeDocument))
+  const sourceDirty = sourceEditable && markdownSource !== savedMarkdownSource
+  const editorTitle = isTextDocument(activeDocument) ? '텍스트 편집기' : 'Markdown 편집기'
+  const editorPlaceholder = isTextDocument(activeDocument)
+    ? '텍스트 내용을 입력하세요'
+    : 'Markdown 내용을 입력하세요'
+  const showViewerChrome = !(sourceEditable && documentMode === 'edit')
 
   const captureViewportAnchor = useCallback((): ViewportPageAnchor | null => {
     const pages = Array.from(
@@ -4925,15 +5025,15 @@ function App() {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
-        if (markdownEditable) {
+        if (sourceEditable) {
           e.preventDefault()
-          void handleSaveMarkdown(false)
+          void handleSaveSourceDocument(false)
           return
         }
       }
       if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
         e.preventDefault()
-        if (deferredDocument && !(markdownEditable && documentMode === 'edit')) {
+        if (deferredDocument && !(sourceEditable && documentMode === 'edit')) {
           setSearchOpen(true)
           setTimeout(() => searchInputRef.current?.focus(), 0)
         }
@@ -4963,7 +5063,7 @@ function App() {
       if (
         !searchOpen &&
         deferredDocument &&
-        !(markdownEditable && documentMode === 'edit') &&
+        !(sourceEditable && documentMode === 'edit') &&
         !(e.target instanceof HTMLInputElement) &&
         !(e.target instanceof HTMLTextAreaElement)
       ) {
@@ -4995,7 +5095,7 @@ function App() {
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [activateFitWidth, adjustZoom, deferredDocument, searchOpen, totalPages, scrollToPage, markdownEditable, documentMode, handleSaveMarkdown])
+  }, [activateFitWidth, adjustZoom, deferredDocument, searchOpen, totalPages, scrollToPage, sourceEditable, documentMode, handleSaveSourceDocument])
 
   const effectiveSearchQuery = useMemo(
     () => (pdfDocumentActive ? compactPdfSearchText(searchQuery) : searchQuery.toLowerCase()),
@@ -5277,9 +5377,9 @@ function App() {
         <div className="brand-lockup">
           <img className="brand-mark" src="/max-viewer-logo.svg" alt="MAX Viewer logo" />
           <div className="title-wrap">
-            <p className="app-kicker">HWP / HWPX / MD / PDF Viewer</p>
+            <p className="app-kicker">HWP / HWPX / MD / TXT / PDF Viewer</p>
             <h1>MAX Viewer</h1>
-            <p className="app-subtitle">한컴 문서와 Markdown을 페이지 형태로 읽고 편집하는 뷰어</p>
+            <p className="app-subtitle">한컴 문서와 Markdown, TXT를 페이지 형태로 읽고 편집하는 뷰어</p>
           </div>
         </div>
 
@@ -5407,7 +5507,7 @@ function App() {
           ) : null}
           {activeDocument ? (
             <>
-              {markdownEditable ? (
+              {sourceEditable ? (
                 <>
                   <div className="view-mode-controls" role="group" aria-label="문서 모드">
                     <button
@@ -5425,11 +5525,11 @@ function App() {
                       편집
                     </button>
                   </div>
-                  {markdownDirty ? <span className="meta-pill">미저장 변경</span> : null}
+                  {sourceDirty ? <span className="meta-pill">미저장 변경</span> : null}
                   <button
                     className="secondary-button"
                     type="button"
-                    onClick={() => void handleSaveMarkdown(false)}
+                    onClick={() => void handleSaveSourceDocument(false)}
                     disabled={savingMarkdown}
                   >
                     {savingMarkdown ? '저장 중...' : '저장'}
@@ -5437,7 +5537,7 @@ function App() {
                   <button
                     className="secondary-button"
                     type="button"
-                    onClick={() => void handleSaveMarkdown(true)}
+                    onClick={() => void handleSaveSourceDocument(true)}
                     disabled={savingMarkdown}
                   >
                     다른 이름으로 저장
@@ -5474,7 +5574,7 @@ function App() {
         </div>
       </header>
 
-      {searchOpen && activeDocument && !(markdownEditable && documentMode === 'edit') ? (
+      {searchOpen && activeDocument && !(sourceEditable && documentMode === 'edit') ? (
         <div className="search-ui">
           <div className="search-bar">
             <input
@@ -5689,10 +5789,10 @@ function App() {
             </div>
           ) : null}
 
-          {markdownEditable && documentMode === 'edit' ? (
+          {sourceEditable && documentMode === 'edit' ? (
             <div className="markdown-editor-stage">
               <div className="markdown-editor-toolbar">
-                <strong>Markdown 편집기</strong>
+                <strong>{editorTitle}</strong>
                 <span className="markdown-editor-hint">편집 중인 내용은 자동으로 뷰어 모드 미리보기에 반영됩니다.</span>
               </div>
               <textarea
@@ -5700,7 +5800,7 @@ function App() {
                 value={markdownSource}
                 onChange={(e) => setMarkdownSource(e.target.value)}
                 spellCheck={false}
-                placeholder="Markdown 내용을 입력하세요"
+                placeholder={editorPlaceholder}
               />
             </div>
           ) : pdfDocumentActive ? (
@@ -5934,7 +6034,7 @@ function App() {
             <p className="app-kicker">시작하기</p>
             <h2>문서를 열어 한컴 문서처럼 확인하세요</h2>
             <p>
-              `.hwp`, `.hwpx`, `.md`, 또는 `.pdf` 파일을 열면 페이지 윤곽과 본문 내용을 이 화면에 바로 표시합니다.
+              `.hwp`, `.hwpx`, `.md`, `.txt`, 또는 `.pdf` 파일을 열면 페이지 윤곽과 본문 내용을 이 화면에 바로 표시합니다.
             </p>
             <div className="empty-actions">
               <button
@@ -5945,7 +6045,7 @@ function App() {
               >
                 {opening ? '파일 여는 중...' : '파일 열기'}
               </button>
-              <span className="empty-hint">지원 형식: .hwp, .hwpx, .md, .pdf — 파일을 끌어다 놓을 수도 있습니다</span>
+              <span className="empty-hint">지원 형식: .hwp, .hwpx, .md, .txt, .pdf — 파일을 끌어다 놓을 수도 있습니다</span>
             </div>
             {recentFiles.length > 0 ? (
               <div className="recent-files">

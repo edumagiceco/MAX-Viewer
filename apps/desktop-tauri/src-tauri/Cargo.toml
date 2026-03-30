@@ -15,6 +15,7 @@ max_viewer_export.workspace = true
 max_viewer_hwp.workspace = true
 max_viewer_hwpx.workspace = true
 max_viewer_markdown.workspace = true
+max_viewer_text.workspace = true
 max_viewer_pdf.workspace = true
 max_viewer_layout.workspace = true
 base64.workspace = true
